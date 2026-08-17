@@ -1,4 +1,3 @@
-telethon
-google-genai
-python-dotenv
-aiohttp
+telethon>=1.44.0
+aiohttp>=3.9.0
+google-genai>=1.0.0

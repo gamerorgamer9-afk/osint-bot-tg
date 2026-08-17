@@ -1,7 +1,9 @@
 import asyncio
 import os
+import re
 import time
 from collections import deque
+from typing import Optional
 
 from aiohttp import web
 from telethon import TelegramClient, events
@@ -24,16 +26,15 @@ PORT = int(os.environ.get("PORT", "8080"))
 
 # Можно поменять модель через Render Environment Variables.
 #
-# gemini-3.6-flash — новее, но на бесплатном тарифе
-# у неё очень маленькая квота (в логах было "limit: 20"),
-# из-за чего .catgirl/.tsundere/.clone/.remember быстро
-# упирались в 429 RESOURCE_EXHAUSTED.
-#
-# gemini-2.5-flash — стабильная модель с гораздо более
-# щедрым бесплатным лимитом, используем её по умолчанию.
+# ВАЖНО: gemini-2.5-flash больше НЕ выдаётся новым ключам —
+# Google возвращает 404 "no longer available to new users"
+# и требует использовать gemini-3.6-flash. Поэтому остаёмся
+# на 3.6-flash и вместо смены модели боремся с её маленькой
+# бесплатной квотой через ретраи и меньшую параллельность
+# (см. GEMINI_SEMAPHORE ниже).
 GEMINI_MODEL = os.environ.get(
     "GEMINI_MODEL",
-    "gemini-2.5-flash"
+    "gemini-3.6-flash"
 )
 
 
@@ -137,7 +138,7 @@ message_cache = deque(
 # Не позволяем бесконечному количеству запросов
 # одновременно улетать в Gemini.
 
-gemini_semaphore = asyncio.Semaphore(4)
+gemini_semaphore = asyncio.Semaphore(1)
 
 
 # ============================================================
@@ -489,7 +490,29 @@ def _is_rate_limit_error(e: Exception) -> bool:
     )
 
 
-async def _with_retry(coro_factory, retries: int = 2, base_delay: float = 2.0):
+def _extract_retry_delay(e: Exception) -> Optional[float]:
+
+    # Google обычно пишет прямо в тексте ошибки, сколько
+    # секунд ждать, например: "Please retry in 16.67s".
+    # Если нашли — используем это число, оно точнее,
+    # чем наш собственный экспоненциальный backoff.
+
+    match = re.search(
+        r"retry in ([\d.]+)s",
+        str(e)
+    )
+
+    if match:
+
+        try:
+            return float(match.group(1)) + 1.0
+        except ValueError:
+            return None
+
+    return None
+
+
+async def _with_retry(coro_factory, retries: int = 3, base_delay: float = 5.0):
 
     # coro_factory — функция БЕЗ аргументов, возвращающая
     # новую корутину при каждом вызове (нужно для повторных попыток).
@@ -509,7 +532,10 @@ async def _with_retry(coro_factory, retries: int = 2, base_delay: float = 2.0):
             if not _is_rate_limit_error(e) or attempt == retries:
                 raise
 
-            delay = base_delay * (2 ** attempt)
+            delay = (
+                _extract_retry_delay(e)
+                or base_delay * (2 ** attempt)
+            )
 
             print(
                 f"⏳ Gemini 429, повтор через {delay:.0f}с "

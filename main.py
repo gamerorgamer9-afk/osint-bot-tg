@@ -512,6 +512,37 @@ def _extract_retry_delay(e: Exception) -> Optional[float]:
     return None
 
 
+def _format_gemini_error(e: Exception) -> str:
+
+    # Собираем понятное сообщение об ошибке.
+    #
+    # Если это лимит 429 — явно показываем, сколько ждать,
+    # т.к. это число часто "отрезается" при обрезке текста
+    # ошибки до 500 символов.
+
+    if _is_rate_limit_error(e):
+
+        delay = _extract_retry_delay(e)
+
+        if delay:
+
+            return (
+                "⏳ Превышен лимит запросов к Gemini "
+                f"(429). Попробуй снова через "
+                f"~{delay:.0f} сек."
+            )
+
+        return (
+            "⏳ Превышен лимит запросов к Gemini (429). "
+            "Не удалось определить точное время ожидания "
+            "из ответа — обычно это 20–60 секунд "
+            "(при исчерпании дневной квоты — "
+            "до полуночи по Тихоокеанскому времени США)."
+        )
+
+    return f"`{str(e)[:500]}`"
+
+
 async def _with_retry(coro_factory, retries: int = 3, base_delay: float = 5.0):
 
     # coro_factory — функция БЕЗ аргументов, возвращающая
@@ -1324,7 +1355,7 @@ async def ai_handler(event):
 
         await event.edit(
             "❌ Ошибка Gemini:\n"
-            f"`{str(e)[:500]}`"
+            + _format_gemini_error(e)
         )
 
 
@@ -1502,7 +1533,7 @@ async def personality_rewriter(event):
                 "me",
                 "⚠️ **Personality rewriter error**\n"
                 f"Mode: `{original_mode}`\n"
-                f"Error: `{repr(e)[:500]}`"
+                + _format_gemini_error(e)
             )
 
         except Exception:
@@ -1635,7 +1666,8 @@ async def clone_handler(event):
         )
 
         await event.edit(
-            f"❌ Ошибка: `{str(e)[:500]}`"
+            "❌ Ошибка: "
+            + _format_gemini_error(e)
         )
 
 
@@ -1759,7 +1791,8 @@ async def remember_handler(event):
         )
 
         await event.edit(
-            f"❌ Ошибка: `{str(e)[:500]}`"
+            "❌ Ошибка: "
+            + _format_gemini_error(e)
         )
 
 

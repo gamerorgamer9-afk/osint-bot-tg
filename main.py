@@ -3,25 +3,31 @@ import os
 import time
 from collections import deque
 
-from aiohttp import web, ClientSession
+from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+
 from google import genai
 from google.genai import types
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
 API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "").strip()
-SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
-
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+API_HASH = os.environ.get("API_HASH", "")
+SESSION_STRING = os.environ.get("SESSION_STRING", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 PORT = int(os.environ.get("PORT", "8080"))
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+
+# Можно поменять модель через Render Environment Variables.
+# Сейчас используется Gemini 3.6 Flash.
+GEMINI_MODEL = os.environ.get(
+    "GEMINI_MODEL",
+    "gemini-3.6-flash"
+)
 
 
 # ============================================================
@@ -29,26 +35,36 @@ RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 # ============================================================
 
 if not API_ID:
-    raise RuntimeError("❌ API_ID не установлен")
+    raise RuntimeError("API_ID не установлен!")
 
 if not API_HASH:
-    raise RuntimeError("❌ API_HASH не установлен")
+    raise RuntimeError("API_HASH не установлен!")
 
 if not SESSION_STRING:
-    raise RuntimeError("❌ SESSION_STRING не установлен")
+    raise RuntimeError("SESSION_STRING не установлен!")
+
+if not GEMINI_API_KEY:
+    print("⚠️ GEMINI_API_KEY не установлен. AI-функции будут отключены.")
 
 
 # ============================================================
 # TELEGRAM CLIENT
 # ============================================================
 
+# ВАЖНО:
+# Используем именно StringSession.
+# Нельзя делать:
+#
+# client.start(phone=lambda: SESSION_STRING)
+#
+# SESSION_STRING — это уже авторизованная String Session.
+
 client = TelegramClient(
     StringSession(SESSION_STRING),
     API_ID,
     API_HASH,
-    auto_reconnect=True,
-    connection_retries=10,
-    retry_delay=5,
+    connection_retries=5,
+    retry_delay=2
 )
 
 
@@ -69,15 +85,27 @@ if GEMINI_API_KEY:
 # ============================================================
 
 bot_state = {
+
+    # Текущая личность:
+    # None
+    # catgirl
+    # tsundere
+    "mode": None,
+
+    # AFK
     "afk": False,
     "afk_reason": "",
     "afk_messages": [],
 
-    # None / catgirl / tsundere
-    "mode": None,
-
+    # Spam
     "spam_active": False,
-    "spam_task": None,
+
+    # Mute:
+    # chat_id -> True
+    #
+    # Работает только для ЛС.
+    "muted_chats": set(),
+
 }
 
 
@@ -85,139 +113,49 @@ bot_state = {
 # MESSAGE CACHE
 # ============================================================
 
-msg_cache = deque(maxlen=500)
+# Храним последние сообщения для логирования удалений.
+#
+# 1500 сообщений достаточно для быстрого отслеживания,
+# но память при этом почти не расходуется.
+
+message_cache = deque(
+    maxlen=1500
+)
 
 
 # ============================================================
-# PERSONALITY SYSTEM
+# GEMINI SEMAPHORE
 # ============================================================
 
-def get_personality_instruction():
-    mode = bot_state.get("mode")
+# Не позволяем бесконечному количеству запросов
+# одновременно улетать в Gemini.
 
-    if mode == "catgirl":
-        return """
-Ты — милая аниме-котодевочка.
-
-Твоя манера общения:
-- дружелюбная;
-- милая;
-- немного игривая;
-- естественная, без чрезмерного переигрывания.
-
-Иногда можешь использовать "ня", "мяу", "мур" и похожие выражения,
-но НЕ используй их в каждом предложении.
-
-Не описывай свои действия в *звёздочках*, если пользователь этого не просит.
-
-Главное — отвечай по существу и сохраняй смысл вопроса пользователя.
-"""
-
-    if mode == "tsundere":
-        return """
-Ты — персонаж цундере.
-
-Твоя манера общения:
-- немного дерзкая;
-- слегка раздражённая;
-- иногда застенчивая;
-- иногда делаешь вид, что тебе всё равно.
-
-Можешь иногда использовать типичные цундере-фразы вроде:
-"б-бука", "не подумай, что я стараюсь ради тебя",
-"я просто так ответила".
-
-Но НЕ используй такие фразы постоянно.
-
-Несмотря на характер, всегда отвечай полезно и по существу.
-Не превращай каждый ответ в карикатуру.
-"""
-
-    return """
-Отвечай обычным нейтральным стилем.
-
-Будь:
-- понятным;
-- кратким;
-- естественным;
-- полезным.
-"""
+gemini_semaphore = asyncio.Semaphore(4)
 
 
 # ============================================================
-# GEMINI NORMAL GENERATION
+# HTTP SERVER FOR RENDER
 # ============================================================
 
-async def fast_gemini_generate(
-    prompt: str,
-    system_instruction: str | None = None
-) -> str:
-
-    if not ai_client:
-        return "❌ GEMINI_API_KEY не настроен."
-
-    personality = get_personality_instruction()
-
-    final_instruction = (
-        system_instruction
-        or "Отвечай максимально понятно и по существу."
-    )
-
-    final_instruction += "\n\n" + personality
-
-    try:
-
-        config = types.GenerateContentConfig(
-            system_instruction=final_instruction,
-            max_output_tokens=350,
-            temperature=0.7,
-        )
-
-        response = await ai_client.aio.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=config,
-        )
-
-        return response.text or "❌ Gemini вернул пустой ответ."
-
-    except Exception as e:
-
-        print(
-            f"❌ Gemini error: "
-            f"{type(e).__name__}: {e}"
-        )
-
-        return f"❌ Ошибка Gemini: {str(e)[:500]}"
-
-
-# ============================================================
-# RENDER WEB SERVER
-# ============================================================
-
-async def handle_root(request):
+async def handle_ping(request):
     return web.Response(
-        text="Telegram Userbot is running.",
-        content_type="text/plain"
+        text="OK - Telegram userbot is running"
     )
-
-
-async def handle_health(request):
-
-    return web.json_response({
-        "status": "ok",
-        "telegram_connected": client.is_connected(),
-        "gemini_configured": ai_client is not None,
-        "mode": bot_state.get("mode"),
-    })
 
 
 async def start_web_server():
 
     app = web.Application()
 
-    app.router.add_get("/", handle_root)
-    app.router.add_get("/health", handle_health)
+    app.router.add_get(
+        "/",
+        handle_ping
+    )
+
+    app.router.add_get(
+        "/health",
+        handle_ping
+    )
 
     runner = web.AppRunner(app)
 
@@ -235,84 +173,447 @@ async def start_web_server():
         f"🌐 Web server запущен на порту {PORT}"
     )
 
-    return runner
+
+# ============================================================
+# PERSONALITY PROMPTS
+# ============================================================
+
+def get_rewrite_personality():
+
+    mode = bot_state["mode"]
+
+
+    # ========================================================
+    # LINIA DEDOLDIA
+    # ========================================================
+
+    if mode == "catgirl":
+
+        return """
+Ты переписываешь сообщение пользователя
+в манере Линии Дедолдии (Linia Dedoldia)
+из "Mushoku Tensei: Jobless Reincarnation".
+
+Ты НЕ отвечаешь пользователю.
+
+Ты только переписываешь его исходное сообщение.
+
+
+ХАРАКТЕР:
+
+Линия:
+
+- самоуверенная;
+- дерзкая;
+- хвастливая;
+- импульсивная;
+- эмоциональная;
+- прямолинейная;
+- немного вспыльчивая;
+- любит показывать своё превосходство;
+- может быть язвительной;
+- иногда ведёт себя по-детски;
+- уважает действительно сильных людей.
+
+Не делай её постоянно милой.
+
+Не делай её постоянно злой.
+
+Основное впечатление:
+самоуверенная, наглая, эмоциональная
+кошачья девушка.
+
+
+МАНЕРА РЕЧИ:
+
+Речь должна быть:
+
+- разговорной;
+- живой;
+- эмоциональной;
+- дерзкой;
+- немного кошачьей;
+- естественной.
+
+Используй "ня" умеренно.
+
+Не добавляй "ня" в каждое предложение.
+
+
+КОШАЧЬИ ИСКАЖЕНИЯ:
+
+Иногда можешь слегка искажать
+отдельные обычные разговорные слова,
+добавляя кошачьи элементы.
+
+Например, допустимы естественные
+небольшие искажения вроде добавления
+"мяу" или окончания "ня".
+
+Используй такие искажения редко.
+
+В среднем:
+0–1 необычное кошачье искажение
+на сообщение.
+
+Иногда вообще не используй искажения.
+
+Не превращай каждое слово
+в кошачью версию.
+
+
+НЕ ДЕЛАЙ:
+
+Не превращай речь в карикатурную
+аниме-котодевочку.
+
+Не используй постоянно:
+
+"мяу"
+
+"мяу-мяу"
+
+"мур"
+
+"мур-мур"
+
+"няшечка"
+
+"няшка"
+
+"uwu"
+
+"nya nya"
+
+Кошачьи особенности должны быть
+небольшой деталью характера.
+
+
+СМЫСЛ:
+
+Полностью сохраняй смысл
+исходного сообщения.
+
+Не добавляй новые факты.
+
+Не придумывай события.
+
+Не меняй намерение пользователя.
+
+Не делай сообщение намного длиннее.
+
+
+ТЕХНИЧЕСКИЕ ДАННЫЕ:
+
+Никогда не изменяй:
+
+- имена;
+- названия;
+- usernames;
+- ссылки;
+- числа;
+- даты;
+- команды;
+- ID;
+- технические термины;
+- код.
+
+
+ФОРМАТ ОТВЕТА:
+
+Верни ТОЛЬКО переписанное сообщение.
+
+Без объяснений.
+
+Без кавычек.
+
+Без слов вроде:
+"Вот версия..."
+
+Без упоминания Gemini.
+
+Без упоминания ИИ.
+
+Без описания своих действий.
+"""
+
+
+    # ========================================================
+    # TSUNDERE
+    # ========================================================
+
+    if mode == "tsundere":
+
+        return """
+Ты переписываешь сообщение пользователя
+в естественной манере цундере.
+
+Ты НЕ отвечаешь пользователю.
+
+Ты только переписываешь
+его исходное сообщение.
+
+
+ХАРАКТЕР:
+
+- самоуверенная;
+- немного дерзкая;
+- эмоциональная;
+- вспыльчивая;
+- иногда смущённая;
+- делает вид, что ей всё равно;
+- может скрывать заботу;
+- иногда подкалывает собеседника;
+- может отрицать собственную симпатию.
+
+Не делай её постоянно злой.
+
+Не делай её постоянно милой.
+
+
+МАНЕРА РЕЧИ:
+
+Используй естественную разговорную речь.
+
+Иногда допустимы короткие эмоциональные
+вставки вроде:
+
+"Пф!"
+
+"Бака!"
+
+"Не то чтобы я..."
+
+"Я просто..."
+
+"Не думай ничего такого!"
+
+Но используй их редко.
+
+Не превращай каждое сообщение
+в аниме-клише.
+
+
+СМЫСЛ:
+
+Полностью сохраняй смысл
+исходного сообщения.
+
+Не добавляй новые факты.
+
+Не придумывай события.
+
+Не меняй намерение пользователя.
+
+Не делай сообщение намного длиннее.
+
+
+ТЕХНИЧЕСКИЕ ДАННЫЕ:
+
+Никогда не изменяй:
+
+- имена;
+- названия;
+- usernames;
+- ссылки;
+- числа;
+- даты;
+- команды;
+- ID;
+- технические термины;
+- код.
+
+
+ФОРМАТ ОТВЕТА:
+
+Верни ТОЛЬКО переписанное сообщение.
+
+Без объяснений.
+
+Без кавычек.
+
+Без слов:
+"Вот версия..."
+
+Не упоминай Gemini.
+
+Не упоминай ИИ.
+"""
+
+
+    return None
 
 
 # ============================================================
-# RENDER SELF PING
+# CLEAN GEMINI OUTPUT
 # ============================================================
 
-async def self_ping_loop():
+def clean_ai_text(text: str) -> str:
 
-    if not RENDER_EXTERNAL_URL:
+    if not text:
+        return ""
 
-        print(
-            "ℹ️ RENDER_EXTERNAL_URL не установлен. "
-            "Self-ping отключён."
+    text = text.strip()
+
+    # Убираем случайные кавычки,
+    # если Gemini решил обернуть ответ.
+    if (
+        len(text) >= 2
+        and text.startswith('"')
+        and text.endswith('"')
+    ):
+        text = text[1:-1].strip()
+
+    return text
+
+
+# ============================================================
+# FAST GEMINI GENERATION
+# ============================================================
+
+async def gemini_generate(
+    prompt: str,
+    system_instruction: str,
+    max_tokens: int = 180
+):
+
+    if not ai_client:
+        raise RuntimeError(
+            "GEMINI_API_KEY не установлен"
         )
 
-        return
+    config = types.GenerateContentConfig(
 
-    print(
-        f"🔄 Self-ping включён: "
-        f"{RENDER_EXTERNAL_URL}"
+        system_instruction=system_instruction,
+
+        max_output_tokens=max_tokens,
+
+        temperature=0.35,
+
+        top_p=0.9,
+
     )
 
-    async with ClientSession() as session:
+    async with gemini_semaphore:
 
-        while True:
+        response = await asyncio.wait_for(
 
-            try:
+            ai_client.aio.models.generate_content(
 
-                await asyncio.sleep(600)
+                model=GEMINI_MODEL,
 
-                async with session.get(
-                    RENDER_EXTERNAL_URL,
-                    timeout=20
-                ) as response:
+                contents=prompt,
 
-                    print(
-                        f"🔄 Self-ping: HTTP "
-                        f"{response.status}"
-                    )
+                config=config
 
-            except asyncio.CancelledError:
-                break
+            ),
 
-            except Exception as e:
+            timeout=12
 
-                print(
-                    f"⚠️ Self-ping ошибка: "
-                    f"{type(e).__name__}: {e}"
-                )
+        )
+
+    return clean_ai_text(
+        response.text or ""
+    )
 
 
 # ============================================================
-# MESSAGE LISTENER / DEBUG
+# FAST STREAMING GEMINI
+# ============================================================
+
+async def gemini_stream(
+    prompt: str,
+    system_instruction: str,
+    max_tokens: int = 180
+):
+
+    if not ai_client:
+        raise RuntimeError(
+            "GEMINI_API_KEY не установлен"
+        )
+
+    config = types.GenerateContentConfig(
+
+        system_instruction=system_instruction,
+
+        max_output_tokens=max_tokens,
+
+        temperature=0.35,
+
+        top_p=0.9,
+
+    )
+
+    async with gemini_semaphore:
+
+        stream = await asyncio.wait_for(
+
+            ai_client.aio.models.generate_content_stream(
+
+                model=GEMINI_MODEL,
+
+                contents=prompt,
+
+                config=config
+
+            ),
+
+            timeout=12
+
+        )
+
+        full_text = ""
+
+        async for chunk in stream:
+
+            try:
+                piece = chunk.text
+            except Exception:
+                piece = None
+
+            if not piece:
+                continue
+
+            full_text += piece
+
+            yield clean_ai_text(full_text)
+
+
+# ============================================================
+# MESSAGE CACHE
 # ============================================================
 
 @client.on(events.NewMessage)
-async def message_listener(event):
+async def cache_listener(event):
 
     try:
 
-        text = event.raw_text or ""
+        message = event.message
 
-        print(
-            f"📩 MESSAGE | "
-            f"chat={event.chat_id} | "
-            f"outgoing={event.out} | "
-            f"text={repr(text[:100])}"
-        )
+        if not message:
+            return
 
-        if event.message and event.message.text:
-            msg_cache.append(event.message)
+        # Кэшируем текстовые сообщения.
+        if message.text:
+
+            message_cache.append({
+
+                "id": message.id,
+
+                "chat_id": event.chat_id,
+
+                "sender_id": message.sender_id,
+
+                "text": message.text,
+
+                "date": message.date,
+
+            })
 
     except Exception as e:
 
         print(
-            f"⚠️ Message listener error: "
-            f"{type(e).__name__}: {e}"
+            f"⚠️ Cache error: {e}"
         )
 
 
@@ -327,57 +628,143 @@ async def deleted_logger(event):
 
         for deleted_id in event.deleted_ids:
 
-            for cached in list(msg_cache):
+            found = None
 
-                if cached.id != deleted_id:
-                    continue
+            for cached in reversed(message_cache):
 
-                try:
+                if cached["id"] == deleted_id:
 
-                    sender = await cached.get_sender()
+                    found = cached
+
+                    break
+
+            if not found:
+                continue
+
+
+            # ------------------------------------------------
+            # Получаем название чата
+            # ------------------------------------------------
+
+            chat_name = "Неизвестный чат"
+
+            try:
+
+                chat = await client.get_entity(
+                    found["chat_id"]
+                )
+
+                if getattr(chat, "title", None):
+
+                    chat_name = chat.title
+
+                elif getattr(chat, "first_name", None):
+
+                    chat_name = chat.first_name
+
+                    if getattr(
+                        chat,
+                        "last_name",
+                        None
+                    ):
+                        chat_name += (
+                            f" {chat.last_name}"
+                        )
+
+                elif getattr(chat, "username", None):
+
+                    chat_name = (
+                        f"@{chat.username}"
+                    )
+
+            except Exception:
+
+                chat_name = (
+                    f"Chat ID: {found['chat_id']}"
+                )
+
+
+            # ------------------------------------------------
+            # Получаем имя отправителя
+            # ------------------------------------------------
+
+            sender_name = "Неизвестно"
+
+            try:
+
+                sender = await client.get_entity(
+                    found["sender_id"]
+                )
+
+                if getattr(sender, "first_name", None):
+
+                    sender_name = sender.first_name
+
+                    if getattr(
+                        sender,
+                        "last_name",
+                        None
+                    ):
+                        sender_name += (
+                            f" {sender.last_name}"
+                        )
+
+                elif getattr(sender, "username", None):
 
                     sender_name = (
-                        getattr(sender, "first_name", None)
-                        or getattr(sender, "username", None)
-                        or "Неизвестно"
+                        f"@{sender.username}"
                     )
 
-                    text = (
-                        cached.text
-                        or "[без текста]"
-                    )
+            except Exception:
+                pass
 
-                    log_text = (
-                        "🗑 **Удалено сообщение!**\n\n"
-                        f"👤 **От:** {sender_name}\n"
-                        f"🆔 `{cached.sender_id}`\n"
-                        f"💬 **Текст:** {text}"
-                    )
 
-                    await client.send_message(
-                        "me",
-                        log_text
-                    )
+            # ------------------------------------------------
+            # Лог
+            # ------------------------------------------------
 
-                except Exception as e:
+            log_text = (
+                "🗑 **Удалено сообщение**\n\n"
 
-                    print(
-                        f"⚠️ Ошибка логирования удаления: "
-                        f"{type(e).__name__}: {e}"
-                    )
+                f"👤 **От:** {sender_name}\n"
 
-                break
+                f"🆔 **Sender ID:** "
+                f"`{found['sender_id']}`\n\n"
+
+                f"📍 **Где:** {chat_name}\n"
+
+                f"🆔 **Chat ID:** "
+                f"`{found['chat_id']}`\n\n"
+
+                f"💬 **Текст:**\n"
+                f"{found['text']}"
+            )
+
+
+            try:
+
+                await client.send_message(
+                    "me",
+                    log_text
+                )
+
+            except Exception as e:
+
+                print(
+                    f"⚠️ Не удалось сохранить "
+                    f"удалённое сообщение: {e}"
+                )
+
 
     except Exception as e:
 
         print(
-            f"⚠️ MessageDeleted error: "
-            f"{type(e).__name__}: {e}"
+            f"❌ Deleted logger error: {e}"
         )
 
 
 # ============================================================
-# .PING
+# PING
 # ============================================================
 
 @client.on(
@@ -388,36 +775,25 @@ async def deleted_logger(event):
 )
 async def ping_handler(event):
 
-    print("🔥 PING HANDLER")
-
     start = time.perf_counter()
 
-    try:
+    await event.edit(
+        "🏓 Проверяю..."
+    )
 
-        await event.edit(
-            "🏓 Pinging..."
-        )
+    ms = round(
+        (time.perf_counter() - start) * 1000,
+        2
+    )
 
-        elapsed = round(
-            (time.perf_counter() - start) * 1000,
-            2
-        )
-
-        await event.edit(
-            f"🚀 **Pong!**\n"
-            f"⚡ Задержка: `{elapsed} ms`"
-        )
-
-    except Exception as e:
-
-        print(
-            f"❌ Ping error: "
-            f"{type(e).__name__}: {e}"
-        )
+    await event.edit(
+        f"🚀 **Pong!**\n"
+        f"⚡ Telegram: `{ms} ms`"
+    )
 
 
 # ============================================================
-# .HELP
+# HELP
 # ============================================================
 
 @client.on(
@@ -428,46 +804,109 @@ async def ping_handler(event):
 )
 async def help_handler(event):
 
-    print("🔥 HELP HANDLER")
+    text = """
+⚙️ **Команды юзербота**
 
-    help_text = (
-        "⚙️ **Юзербот — команды**\n\n"
+🏓 `.ping`
+Проверка Telegram.
 
-        "🏓 `.ping` — проверить работу\n"
-        "📚 `.help` — список команд\n\n"
+🧠 `.ai текст`
+Gemini без выбранной личности.
 
-        "💤 `.afk [причина]` — включить AFK\n"
-        "🌅 `.unafk` — выключить AFK\n\n"
+🎭 `.catgirl`
+Стиль Линии Дедолдии.
 
-        "🧠 `.ai [текст]` — Gemini AI\n"
-        "📝 `.remember [число]` — саммари чата\n"
-        "🎭 `.clone` — скопировать стиль\n\n"
+🔥 `.tsundere`
+Стиль цундере.
 
-        "🐱 `.catgirl` — режим котодевочки\n"
-        "😤 `.tsundere` — режим цундере\n"
-        "🔄 `.reset` — обычный режим\n"
-        "🎭 `.mode` — показать режим\n\n"
+🔄 `.reset`
+Отключить личность.
 
-        "📨 `.spam [количество] [текст]`\n"
-        "⏹ `.stop` — остановить spam"
+🎭 `.clone`
+Клонирование стиля автора сообщения.
+Не использует текущую личность.
+
+💤 `.afk [причина]`
+Включить AFK.
+
+🌅 `.unafk`
+Выключить AFK.
+
+🔇 `.mute`
+Удалять следующие сообщения собеседника в ЛС.
+
+🔊 `.unmute`
+Выключить mute.
+
+📨 `.spam количество текст`
+Запустить spam.
+
+⛔ `.off`
+Принудительно остановить spam.
+
+🗑 Удалённые сообщения
+Сохраняются в Избранные с указанием чата.
+"""
+
+    await event.edit(text)
+
+
+# ============================================================
+# PERSONALITY COMMAND
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.(catgirl|tsundere|reset)$"
     )
+)
+async def personality_handler(event):
 
-    try:
+    command = event.pattern_match.group(1)
+
+
+    if command == "reset":
+
+        bot_state["mode"] = None
 
         await event.edit(
-            help_text
+            "🔄 **Режим личности отключён.**"
         )
 
-    except Exception as e:
+        print(
+            "🎭 Personality: OFF"
+        )
+
+        return
+
+
+    bot_state["mode"] = command
+
+
+    if command == "catgirl":
+
+        await event.edit(
+            "🐱 **Режим Линии Дедолдии включён.**"
+        )
 
         print(
-            f"❌ Help error: "
-            f"{type(e).__name__}: {e}"
+            "🐱 Personality: LINIA"
+        )
+
+    elif command == "tsundere":
+
+        await event.edit(
+            "🔥 **Режим цундере включён.**"
+        )
+
+        print(
+            "🔥 Personality: TSUNDERE"
         )
 
 
 # ============================================================
-# AFK ON
+# AFK
 # ============================================================
 
 @client.on(
@@ -484,22 +923,16 @@ async def afk_on(event):
     )
 
     bot_state["afk"] = True
+
     bot_state["afk_reason"] = reason
+
     bot_state["afk_messages"] = []
 
-    print(
-        f"💤 AFK ON: {reason}"
-    )
-
     await event.edit(
-        f"💤 **Режим AFK включен.**\n"
+        f"💤 **AFK включён**\n"
         f"Причина: `{reason}`"
     )
 
-
-# ============================================================
-# AFK OFF
-# ============================================================
 
 @client.on(
     events.NewMessage(
@@ -512,22 +945,27 @@ async def afk_off(event):
     if not bot_state["afk"]:
 
         await event.edit(
-            "❌ Вы не находитесь в AFK."
+            "❌ AFK сейчас выключен."
         )
 
         return
+
 
     count = len(
         bot_state["afk_messages"]
     )
 
+
     bot_state["afk"] = False
+
     bot_state["afk_reason"] = ""
 
+    bot_state["afk_messages"] = []
+
+
     await event.edit(
-        "🌅 **AFK выключен.**\n\n"
-        f"📨 Пока вас не было, "
-        f"вам написали: `{count}` раз(а)."
+        f"🌅 **AFK выключен.**\n"
+        f"Сообщений во время AFK: `{count}`"
     )
 
 
@@ -535,11 +973,7 @@ async def afk_off(event):
 # AFK LISTENER
 # ============================================================
 
-@client.on(
-    events.NewMessage(
-        incoming=True
-    )
-)
+@client.on(events.NewMessage(incoming=True))
 async def afk_listener(event):
 
     if not bot_state["afk"]:
@@ -551,40 +985,141 @@ async def afk_listener(event):
     ):
         return
 
+
+    sender = await event.get_sender()
+
+    name = (
+        getattr(
+            sender,
+            "first_name",
+            None
+        )
+        or "Кто-то"
+    )
+
+
+    bot_state["afk_messages"].append({
+
+        "name": name,
+
+        "text": event.text or ""
+
+    })
+
+
     try:
 
-        sender = await event.get_sender()
-
-        name = (
-            getattr(sender, "first_name", None)
-            or getattr(sender, "username", None)
-            or "Кто-то"
-        )
-
-        text = (
-            event.raw_text
-            or "[без текста]"
-        )
-
-        bot_state["afk_messages"].append(
-            f"{name}: {text}"
-        )
-
         await event.reply(
-            "🤖 **Я сейчас AFK.**\n"
+            "🤖 Я сейчас AFK.\n"
             f"Причина: `{bot_state['afk_reason']}`"
         )
 
     except Exception as e:
 
         print(
-            f"❌ AFK error: "
-            f"{type(e).__name__}: {e}"
+            f"⚠️ AFK reply error: {e}"
         )
 
 
 # ============================================================
-# .AI
+# MUTE
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.mute$"
+    )
+)
+async def mute_handler(event):
+
+    if not event.is_private:
+
+        await event.edit(
+            "❌ `.mute` работает только в ЛС."
+        )
+
+        return
+
+
+    bot_state["muted_chats"].add(
+        event.chat_id
+    )
+
+
+    await event.edit(
+        "🔇 **Mute включён.**\n"
+        "Следующие сообщения собеседника "
+        "в этом ЛС будут удаляться."
+    )
+
+
+# ============================================================
+# UNMUTE
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.unmute$"
+    )
+)
+async def unmute_handler(event):
+
+    if not event.is_private:
+
+        await event.edit(
+            "❌ `.unmute` работает только в ЛС."
+        )
+
+        return
+
+
+    bot_state["muted_chats"].discard(
+        event.chat_id
+    )
+
+
+    await event.edit(
+        "🔊 **Mute выключен.**"
+    )
+
+
+# ============================================================
+# MUTE LISTENER
+# ============================================================
+
+@client.on(events.NewMessage(incoming=True))
+async def mute_listener(event):
+
+    if not event.is_private:
+        return
+
+
+    if event.chat_id not in bot_state[
+        "muted_chats"
+    ]:
+        return
+
+
+    try:
+
+        await event.delete()
+
+        print(
+            f"🔇 Удалено сообщение "
+            f"из muted ЛС: {event.chat_id}"
+        )
+
+    except Exception as e:
+
+        print(
+            f"⚠️ Mute delete error: {e}"
+        )
+
+
+# ============================================================
+# AI COMMAND
 # ============================================================
 
 @client.on(
@@ -597,194 +1132,408 @@ async def ai_handler(event):
 
     prompt = event.pattern_match.group(1)
 
-    mode = bot_state.get("mode")
-
-    print(
-        f"🧠 AI request | "
-        f"mode={mode} | "
-        f"prompt={prompt[:100]}"
-    )
 
     if not ai_client:
 
         await event.edit(
-            "❌ `GEMINI_API_KEY` не настроен."
+            "❌ GEMINI_API_KEY не установлен."
         )
 
         return
 
-    personality = get_personality_instruction()
+
+    await event.edit(
+        "🧠 Генерирую..."
+    )
+
+
+    system_prompt = """
+Ты полезный AI-ассистент.
+
+Отвечай кратко, понятно и по существу.
+
+Не используй никакие выбранные
+пользователем ролевые личности.
+
+Не используй стиль Линии.
+
+Не используй стиль цундере.
+
+Не добавляй "ня", "мяу" и подобные слова,
+если пользователь специально этого не попросил.
+
+Отвечай только на запрос пользователя.
+"""
+
 
     try:
 
-        await event.edit(
-            "🧠 *Генерация...*"
-        )
+        # ----------------------------------------------------
+        # STREAMING
+        # ----------------------------------------------------
 
-        response = (
-            await ai_client.aio.models.generate_content_stream(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=personality,
-                    max_output_tokens=400,
-                    temperature=0.7,
-                )
-            )
-        )
+        current_text = ""
 
-        full_text = ""
+        first_update = True
 
-        last_update = time.time()
+        last_edit = 0.0
 
-        async for chunk in response:
 
-            if not chunk.text:
+        async for partial in gemini_stream(
+            prompt,
+            system_prompt,
+            max_tokens=400
+        ):
+
+            if not partial:
                 continue
 
-            full_text += chunk.text
 
+            current_text = partial
+
+
+            now = time.monotonic()
+
+
+            # Первое обновление сразу.
+            #
+            # Последующие не чаще ~0.7 сек,
+            # чтобы не получить FloodWait.
             if (
-                time.time() - last_update >= 1.5
-                and full_text
+                first_update
+                or now - last_edit >= 0.7
             ):
 
-                try:
+                await event.edit(
+                    current_text + " ▌"
+                )
 
-                    await event.edit(
-                        full_text + " ▌"
-                    )
+                first_update = False
 
-                    last_update = time.time()
+                last_edit = now
 
-                except Exception:
-                    pass
 
-        if not full_text:
+        if current_text:
 
-            full_text = (
+            await event.edit(
+                current_text
+            )
+
+        else:
+
+            await event.edit(
                 "❌ Gemini не вернул текст."
             )
 
-        await event.edit(
-            full_text
-        )
 
     except Exception as e:
 
         print(
-            f"❌ AI error: "
-            f"{type(e).__name__}: {e}"
+            f"❌ Gemini error: {repr(e)}"
         )
 
         await event.edit(
-            f"❌ Ошибка Gemini:\n"
+            "❌ Ошибка Gemini:\n"
             f"`{str(e)[:500]}`"
         )
 
 
 # ============================================================
-# PERSONALITY MODES
+# PERSONALITY REWRITER
+# ============================================================
+
+@client.on(events.NewMessage(outgoing=True))
+async def personality_rewriter(event):
+
+    # --------------------------------------------------------
+    # Нет активной личности
+    # --------------------------------------------------------
+
+    if bot_state["mode"] is None:
+        return
+
+
+    # --------------------------------------------------------
+    # Только текст
+    # --------------------------------------------------------
+
+    if not event.text:
+        return
+
+
+    text = event.text.strip()
+
+
+    if not text:
+        return
+
+
+    # --------------------------------------------------------
+    # НЕ обрабатываем команды
+    # --------------------------------------------------------
+
+    if text.startswith("."):
+        return
+
+
+    # --------------------------------------------------------
+    # Получаем текущий промпт
+    # --------------------------------------------------------
+
+    system_prompt = get_rewrite_personality()
+
+
+    if not system_prompt:
+        return
+
+
+    original_mode = bot_state["mode"]
+
+
+    # --------------------------------------------------------
+    # Gemini
+    # --------------------------------------------------------
+
+    try:
+
+        # Сразу показываем обработку.
+        #
+        # Это почти не влияет на скорость,
+        # но пользователь видит, что сообщение принято.
+
+        await event.edit(
+            text + " ▌"
+        )
+
+
+        current_text = ""
+
+        first_update = True
+
+        last_edit = 0.0
+
+
+        async for partial in gemini_stream(
+            text,
+            system_prompt,
+            max_tokens=180
+        ):
+
+            if not partial:
+                continue
+
+
+            current_text = partial
+
+
+            now = time.monotonic()
+
+
+            # ------------------------------------------------
+            # Очень быстрое первое обновление
+            # ------------------------------------------------
+
+            if first_update:
+
+                await event.edit(
+                    current_text + " ▌"
+                )
+
+                first_update = False
+
+                last_edit = now
+
+                continue
+
+
+            # ------------------------------------------------
+            # Последующие обновления
+            # ------------------------------------------------
+
+            if now - last_edit >= 0.7:
+
+                await event.edit(
+                    current_text + " ▌"
+                )
+
+                last_edit = now
+
+
+        # ----------------------------------------------------
+        # Если режим не изменился во время генерации,
+        # публикуем результат.
+        #
+        # Если пользователь успел сделать .reset
+        # или сменить личность — старый запрос всё равно
+        # заканчивается, но сообщение не будет дополнительно
+        # обрабатываться.
+        # ----------------------------------------------------
+
+        if current_text:
+
+            await event.edit(
+                current_text
+            )
+
+        else:
+
+            await event.edit(
+                text
+            )
+
+
+    except Exception as e:
+
+        print(
+            f"❌ Personality error "
+            f"({original_mode}): {repr(e)}"
+        )
+
+        # При ошибке возвращаем оригинальное сообщение,
+        # чтобы оно не оставалось с "▌".
+
+        try:
+
+            await event.edit(
+                text
+            )
+
+        except Exception:
+            pass
+
+
+# ============================================================
+# CLONE
 # ============================================================
 
 @client.on(
     events.NewMessage(
         outgoing=True,
-        pattern=r"^\.(catgirl|tsundere|reset)$"
+        pattern=r"^\.clone$"
     )
 )
-async def mode_handler(event):
+async def clone_handler(event):
 
-    command = event.pattern_match.group(1)
+    reply = await event.get_reply_message()
 
-    if command == "catgirl":
 
-        bot_state["mode"] = "catgirl"
+    if not reply or not reply.sender_id:
 
         await event.edit(
-            "🐱 **Режим котодевочки активирован!**\n\n"
-            "Теперь `.ai` будет отвечать "
-            "в стиле милой аниме-котодевочки."
-        )
-
-        print(
-            "🐱 MODE = CATGIRL"
+            "❌ Используй `.clone` "
+            "ответом на сообщение пользователя."
         )
 
         return
 
-    if command == "tsundere":
-
-        bot_state["mode"] = "tsundere"
-
-        await event.edit(
-            "😤 **Режим цундере активирован!**\n\n"
-            "Теперь `.ai` будет отвечать "
-            "в стиле цундере."
-        )
-
-        print(
-            "😤 MODE = TSUNDERE"
-        )
-
-        return
-
-    if command == "reset":
-
-        bot_state["mode"] = None
-
-        await event.edit(
-            "🔄 **Режим личности сброшен.**\n\n"
-            "Теперь `.ai` использует обычный стиль."
-        )
-
-        print(
-            "🔄 MODE = NORMAL"
-        )
-
-
-# ============================================================
-# .MODE
-# ============================================================
-
-@client.on(
-    events.NewMessage(
-        outgoing=True,
-        pattern=r"^\.mode$"
-    )
-)
-async def mode_status(event):
-
-    mode = bot_state.get("mode")
-
-    if mode == "catgirl":
-
-        text = (
-            "🐱 Сейчас активен режим "
-            "**котодевочки**."
-        )
-
-    elif mode == "tsundere":
-
-        text = (
-            "😤 Сейчас активен режим "
-            "**цундере**."
-        )
-
-    else:
-
-        text = (
-            "🔄 Сейчас активен "
-            "**обычный режим**."
-        )
 
     await event.edit(
-        text
+        "🎭 Анализирую стиль..."
     )
 
 
+    try:
+
+        messages = await client.get_messages(
+
+            event.chat_id,
+
+            limit=40,
+
+            from_user=reply.sender_id
+
+        )
+
+
+        texts = [
+
+            m.text
+
+            for m in messages
+
+            if m.text
+
+        ]
+
+
+        if not texts:
+
+            await event.edit(
+                "❌ Недостаточно сообщений."
+            )
+
+            return
+
+
+        sample = "\n".join(
+            texts[:15]
+        )
+
+
+        prompt = f"""
+Проанализируй стиль автора сообщений
+и напиши ОДНО короткое сообщение
+в похожей манере.
+
+Не отвечай на содержимое сообщений.
+
+Не используй личность пользователя.
+
+Не используй режим catgirl.
+
+Не используй tsundere.
+
+Не добавляй "ня" или "мяу"
+только потому, что у пользователя
+может быть активирован другой режим.
+
+Верни только одно сообщение.
+
+Примеры сообщений автора:
+
+{sample}
+"""
+
+
+        system_prompt = """
+Ты анализируешь стиль текста.
+
+Твоя задача — написать короткое сообщение,
+похожее по стилю, лексике, длине,
+пунктуации и эмоциональной манере
+на предоставленные сообщения.
+
+Не копируй сообщение дословно.
+
+Не добавляй объяснения.
+"""
+
+
+        result = await gemini_generate(
+            prompt,
+            system_prompt,
+            max_tokens=120
+        )
+
+
+        await event.edit(
+            result or "❌ Gemini не вернул результат."
+        )
+
+
+    except Exception as e:
+
+        print(
+            f"❌ Clone error: {repr(e)}"
+        )
+
+        await event.edit(
+            f"❌ Ошибка: `{str(e)[:500]}`"
+        )
+
+
 # ============================================================
-# .REMEMBER
+# REMEMBER
 # ============================================================
 
 @client.on(
@@ -807,180 +1556,108 @@ async def remember_handler(event):
             min(limit, 100)
         )
 
+
         await event.edit(
-            f"📊 Анализирую последние "
-            f"`{limit}` сообщений..."
+            f"📊 Анализирую "
+            f"последние {limit} сообщений..."
         )
 
-        raw_messages = await client.get_messages(
+
+        messages = await client.get_messages(
             event.chat_id,
             limit=limit
         )
 
+
         history = []
 
-        for message in reversed(
-            raw_messages
-        ):
+
+        for message in reversed(messages):
 
             if not message.text:
                 continue
+
+
+            name = "User"
+
 
             try:
 
                 sender = await message.get_sender()
 
-                name = (
-                    getattr(
-                        sender,
-                        "first_name",
-                        None
-                    )
-                    or getattr(
-                        sender,
-                        "username",
-                        None
-                    )
-                    or "User"
-                )
+                if getattr(
+                    sender,
+                    "first_name",
+                    None
+                ):
+
+                    name = sender.first_name
 
             except Exception:
+                pass
 
-                name = "User"
 
             history.append(
                 f"{name}: {message.text}"
             )
 
+
         if not history:
 
             await event.edit(
-                "❌ Не удалось найти "
-                "текстовые сообщения."
+                "❌ Нет текстовых сообщений."
             )
 
             return
 
-        context_text = "\n".join(
+
+        context = "\n".join(
             history
         )
 
-        prompt = (
-            "Сделай краткое и понятное "
-            "саммари этой переписки "
-            "на русском языке.\n\n"
-            f"{context_text}"
+
+        prompt = f"""
+Сделай краткое и понятное саммари
+этой переписки.
+
+Не используй личность Линии.
+
+Не используй цундере.
+
+Не добавляй ролевой стиль.
+
+Переписка:
+
+{context}
+"""
+
+
+        result = await gemini_generate(
+            prompt,
+            "Отвечай кратко и структурированно.",
+            max_tokens=300
         )
 
-        result = await fast_gemini_generate(
-            prompt
-        )
 
         await event.edit(
-            f"📝 **Краткая выжимка:**\n\n"
-            f"{result}"
+            "📝 **Краткая выжимка:**\n\n"
+            + result
         )
+
 
     except Exception as e:
 
         print(
-            f"❌ Remember error: "
-            f"{type(e).__name__}: {e}"
+            f"❌ Remember error: {repr(e)}"
         )
 
         await event.edit(
-            f"❌ Ошибка:\n"
-            f"`{str(e)[:500]}`"
+            f"❌ Ошибка: `{str(e)[:500]}`"
         )
 
 
 # ============================================================
-# .CLONE
-# ============================================================
-
-@client.on(
-    events.NewMessage(
-        outgoing=True,
-        pattern=r"^\.clone$"
-    )
-)
-async def clone_handler(event):
-
-    try:
-
-        reply = await event.get_reply_message()
-
-        if not reply or not reply.sender_id:
-
-            await event.edit(
-                "❌ Используй `.clone` "
-                "ответом на сообщение пользователя."
-            )
-
-            return
-
-        await event.edit(
-            "🎭 Анализирую манеру речи..."
-        )
-
-        messages = await client.get_messages(
-            event.chat_id,
-            limit=40,
-            from_user=reply.sender_id
-        )
-
-        texts = [
-            message.text
-            for message in messages
-            if message.text
-        ]
-
-        if not texts:
-
-            await event.edit(
-                "❌ Недостаточно сообщений "
-                "для анализа."
-            )
-
-            return
-
-        sample = "\n".join(
-            texts[:15]
-        )
-
-        prompt = (
-            "Проанализируй стиль автора "
-            "по следующим сообщениям.\n\n"
-            "Затем напиши одно короткое "
-            "предложение в похожей манере.\n\n"
-            "Сохрани характерную пунктуацию, "
-            "сленг и стиль.\n\n"
-            f"{sample}"
-        )
-
-        result = await fast_gemini_generate(
-            prompt
-        )
-
-        await event.edit(
-            result
-        )
-
-    except Exception as e:
-
-        print(
-            f"❌ Clone error: "
-            f"{type(e).__name__}: {e}"
-        )
-
-        await event.edit(
-            f"❌ Ошибка:\n"
-            f"`{str(e)[:500]}`"
-        )
-
-
-# ============================================================
-# .SPAM
+# SPAM
 # ============================================================
 
 @client.on(
@@ -991,238 +1668,224 @@ async def clone_handler(event):
 )
 async def spam_handler(event):
 
+    count = int(
+        event.pattern_match.group(1)
+    )
+
+    text = event.pattern_match.group(2)
+
+
+    # Ограничение от случайного
+    # огромного количества сообщений.
+    count = max(
+        1,
+        min(count, 100)
+    )
+
+
+    await event.delete()
+
+
+    # Останавливаем предыдущий spam.
+    bot_state["spam_active"] = False
+
+    await asyncio.sleep(0.05)
+
+
+    bot_state["spam_active"] = True
+
+
+    print(
+        f"📨 Spam started: {count}"
+    )
+
+
     try:
 
-        count = int(
-            event.pattern_match.group(1)
-        )
+        for _ in range(count):
 
-        text = event.pattern_match.group(2)
+            if not bot_state[
+                "spam_active"
+            ]:
+                break
 
-        # Ограничение
-        count = max(
-            1,
-            min(count, 100)
-        )
 
-        # Останавливаем предыдущую задачу
-        old_task = bot_state.get(
-            "spam_task"
-        )
+            await client.send_message(
+                event.chat_id,
+                text
+            )
 
-        if old_task and not old_task.done():
 
-            bot_state["spam_active"] = False
+            # 0.3 сек между сообщениями.
+            await asyncio.sleep(
+                0.3
+            )
 
-            old_task.cancel()
-
-        await event.delete()
-
-        bot_state["spam_active"] = True
-
-        async def spam_loop():
-
-            try:
-
-                for _ in range(count):
-
-                    if not bot_state[
-                        "spam_active"
-                    ]:
-                        break
-
-                    await client.send_message(
-                        event.chat_id,
-                        text
-                    )
-
-                    await asyncio.sleep(
-                        0.5
-                    )
-
-            except asyncio.CancelledError:
-
-                pass
-
-            except Exception as e:
-
-                print(
-                    f"❌ Spam error: "
-                    f"{type(e).__name__}: {e}"
-                )
-
-            finally:
-
-                bot_state["spam_active"] = False
-                bot_state["spam_task"] = None
-
-        task = asyncio.create_task(
-            spam_loop()
-        )
-
-        bot_state["spam_task"] = task
 
     except Exception as e:
 
         print(
-            f"❌ Spam handler error: "
-            f"{type(e).__name__}: {e}"
+            f"❌ Spam error: {repr(e)}"
+        )
+
+
+    finally:
+
+        bot_state["spam_active"] = False
+
+
+        print(
+            "📨 Spam finished"
         )
 
 
 # ============================================================
-# .STOP
+# OFF
 # ============================================================
 
 @client.on(
     events.NewMessage(
         outgoing=True,
-        pattern=r"^\.stop$"
+        pattern=r"^\.off$"
     )
 )
-async def stop_spam(event):
+async def off_handler(event):
 
     bot_state["spam_active"] = False
 
-    task = bot_state.get(
-        "spam_task"
-    )
-
-    if task and not task.done():
-
-        task.cancel()
-
-    bot_state["spam_task"] = None
 
     await event.edit(
-        "⏹ **Процесс остановлен.**"
+        "⛔ **Spam принудительно остановлен.**"
     )
 
 
 # ============================================================
-# MAIN
+# STARTUP
 # ============================================================
 
 async def main():
 
-    print("=" * 60)
-    print("🚀 ЗАПУСК TELEGRAM USERBOT")
-    print("=" * 60)
-
     print(
-        f"🔧 API_ID: {API_ID}"
+        "=========================================="
     )
 
     print(
-        "🔧 API_HASH: "
-        f"{'OK' if API_HASH else 'MISSING'}"
+        "🚀 Telegram Userbot starting..."
     )
 
     print(
-        "🔧 SESSION_STRING: "
-        f"{'OK' if SESSION_STRING else 'MISSING'}"
+        f"🧠 Gemini model: {GEMINI_MODEL}"
     )
 
     print(
-        "🔧 GEMINI: "
-        f"{'OK' if ai_client else 'DISABLED'}"
+        "=========================================="
     )
 
-    # Render HTTP server
+
+    # --------------------------------------------------------
+    # Web server
+    # --------------------------------------------------------
+
     await start_web_server()
 
-    # Self-ping
-    asyncio.create_task(
-        self_ping_loop()
+
+    # --------------------------------------------------------
+    # Telegram
+    # --------------------------------------------------------
+
+    print(
+        "🔐 Подключение к Telegram..."
     )
 
-    # Telegram
-    try:
 
-        print(
-            "🔌 Подключение к Telegram..."
+    await client.connect()
+
+
+    if not await client.is_user_authorized():
+
+        raise RuntimeError(
+            "SESSION_STRING недействителен "
+            "или Telegram-сессия не авторизована."
         )
 
-        await client.start()
 
-        me = await client.get_me()
+    me = await client.get_me()
 
-        print("=" * 60)
-        print(
-            "✅ TELEGRAM УСПЕШНО ПОДКЛЮЧЕН"
-        )
 
-        print(
-            f"👤 Имя: {me.first_name}"
-        )
+    print(
+        "=========================================="
+    )
 
-        print(
-            f"🆔 ID: {me.id}"
-        )
+    print(
+        "✅ USERBOT УСПЕШНО ЗАПУЩЕН"
+    )
 
-        if me.username:
+    print(
+        f"👤 Имя: "
+        f"{getattr(me, 'first_name', 'Unknown')}"
+    )
 
-            print(
-                f"📛 Username: @{me.username}"
-            )
+    print(
+        f"🆔 ID: {me.id}"
+    )
 
-        else:
+    print(
+        f"📱 Username: "
+        f"@{me.username}"
+        if me.username
+        else "📱 Username: отсутствует"
+    )
 
-            print(
-                "📛 Username: отсутствует"
-            )
+    print(
+        "=========================================="
+    )
 
-        print("=" * 60)
 
-        print(
-            "👂 Ожидаю команды..."
-        )
+    # --------------------------------------------------------
+    # Проверяем Gemini
+    # --------------------------------------------------------
 
-        print(
-            "👉 Попробуй отправить: .ping"
-        )
-
-        await client.run_until_disconnected()
-
-    except Exception as e:
-
-        print("=" * 60)
-        print(
-            "❌ КРИТИЧЕСКАЯ ОШИБКА TELEGRAM"
-        )
+    if ai_client:
 
         print(
-            f"Тип: {type(e).__name__}"
+            "🧠 Gemini: включён"
         )
+
+    else:
 
         print(
-            f"Ошибка: {e}"
+            "⚠️ Gemini: выключен"
         )
 
-        print("=" * 60)
 
-        raise
+    print(
+        "👂 Ожидаю сообщения..."
+    )
+
+
+    await client.run_until_disconnected()
 
 
 # ============================================================
-# ENTRY POINT
+# RUN
 # ============================================================
 
 if __name__ == "__main__":
 
     try:
 
-        asyncio.run(main())
+        asyncio.run(
+            main()
+        )
 
     except KeyboardInterrupt:
 
         print(
-            "🛑 Остановлено пользователем."
+            "🛑 Userbot stopped."
         )
 
     except Exception as e:
 
         print(
-            f"💥 Application crashed: "
-            f"{type(e).__name__}: {e}"
+            f"💥 FATAL ERROR: {repr(e)}"
         )

@@ -24,18 +24,38 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 PORT = int(os.environ.get("PORT", "8080"))
 
-# Можно поменять модель через Render Environment Variables.
+# Можно поменять модели через Render Environment Variables.
 #
 # ВАЖНО: gemini-2.5-flash больше НЕ выдаётся новым ключам —
 # Google возвращает 404 "no longer available to new users"
-# и требует использовать gemini-3.6-flash. Поэтому остаёмся
-# на 3.6-flash и вместо смены модели боремся с её маленькой
-# бесплатной квотой через ретраи и меньшую параллельность
-# (см. GEMINI_SEMAPHORE ниже).
-GEMINI_MODEL = os.environ.get(
-    "GEMINI_MODEL",
-    "gemini-3.6-flash"
-)
+# и требует использовать gemini-3.6-flash.
+#
+# У Google квоты бесплатного тарифа считаются ОТДЕЛЬНО
+# для каждой модели. Поэтому вместо одной модели используем
+# ЦЕПОЧКУ: если у первой модели кончился лимит (429/quota),
+# автоматически пробуем следующую — у неё свой независимый
+# лимит, ещё не тронутый.
+#
+# Порядок: основная модель первая, дальше — более лёгкие
+# "lite"-модели как запасной вариант.
+#
+# Переопределить можно через GEMINI_MODELS
+# (модели через запятую).
+GEMINI_MODELS = [
+    m.strip()
+    for m in os.environ.get(
+        "GEMINI_MODELS",
+        "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite"
+    ).split(",")
+    if m.strip()
+]
+
+# Оставляем и старую переменную для обратной совместимости —
+# если задана вручную, ставим её первой в цепочке.
+_legacy_model = os.environ.get("GEMINI_MODEL")
+
+if _legacy_model and _legacy_model not in GEMINI_MODELS:
+    GEMINI_MODELS.insert(0, _legacy_model)
 
 
 # ============================================================
@@ -490,6 +510,32 @@ def _is_rate_limit_error(e: Exception) -> bool:
     )
 
 
+def _is_model_unavailable_error(e: Exception) -> bool:
+
+    # Модель может быть недоступна конкретно этому ключу
+    # ("no longer available to new users") или не существовать
+    # под этим именем — в обоих случаях есть смысл просто
+    # попробовать следующую модель в цепочке, а не сразу
+    # сдаваться.
+
+    msg = str(e)
+
+    return (
+        "404" in msg
+        or "NOT_FOUND" in msg
+        or "not found" in msg.lower()
+        or "no longer available" in msg.lower()
+    )
+
+
+def _should_try_next_model(e: Exception) -> bool:
+
+    return (
+        _is_rate_limit_error(e)
+        or _is_model_unavailable_error(e)
+    )
+
+
 def _extract_retry_delay(e: Exception) -> Optional[float]:
 
     # Google обычно пишет прямо в тексте ошибки, сколько
@@ -605,31 +651,64 @@ async def gemini_generate(
 
     )
 
-    async def _call():
+    last_error = None
 
-        async with gemini_semaphore:
+    for model in GEMINI_MODELS:
 
-            return await asyncio.wait_for(
+        async def _call(model=model):
 
-                ai_client.aio.models.generate_content(
+            async with gemini_semaphore:
 
-                    model=GEMINI_MODEL,
+                return await asyncio.wait_for(
 
-                    contents=prompt,
+                    ai_client.aio.models.generate_content(
 
-                    config=config
+                        model=model,
 
-                ),
+                        contents=prompt,
 
-                timeout=12
+                        config=config
 
+                    ),
+
+                    timeout=12
+
+                )
+
+        try:
+
+            # На каждую модель — по 1 повтору, чтобы не
+            # тратить всё время на одну модель, если рядом
+            # есть ещё две с чистой квотой.
+            response = await _with_retry(
+                _call,
+                retries=1,
+                base_delay=3.0
             )
 
-    response = await _with_retry(_call)
+            return clean_ai_text(
+                response.text or ""
+            )
 
-    return clean_ai_text(
-        response.text or ""
-    )
+        except Exception as e:
+
+            last_error = e
+
+            if not _should_try_next_model(e):
+                raise
+
+            reason = (
+                "исчерпал лимит"
+                if _is_rate_limit_error(e)
+                else "недоступна для этого ключа"
+            )
+
+            print(
+                f"↪️ {model} {reason}, "
+                "пробуем следующую модель..."
+            )
+
+    raise last_error
 
 
 # ============================================================
@@ -659,29 +738,64 @@ async def gemini_stream(
 
     )
 
-    async def _open_stream():
+    stream = None
+    last_error = None
 
-        async with gemini_semaphore:
+    for model in GEMINI_MODELS:
 
-            return await asyncio.wait_for(
+        async def _open_stream(model=model):
 
-                ai_client.aio.models.generate_content_stream(
+            async with gemini_semaphore:
 
-                    model=GEMINI_MODEL,
+                return await asyncio.wait_for(
 
-                    contents=prompt,
+                    ai_client.aio.models.generate_content_stream(
 
-                    config=config
+                        model=model,
 
-                ),
+                        contents=prompt,
 
-                timeout=12
+                        config=config
 
+                    ),
+
+                    timeout=12
+
+                )
+
+        try:
+
+            # Ретраим только открытие стрима (сам 429
+            # прилетает именно на этом шаге, до получения
+            # первых чанков).
+            stream = await _with_retry(
+                _open_stream,
+                retries=1,
+                base_delay=3.0
             )
 
-    # Ретраим только открытие стрима (сам 429 прилетает
-    # именно на этом шаге, до получения первых чанков).
-    stream = await _with_retry(_open_stream)
+            break
+
+        except Exception as e:
+
+            last_error = e
+
+            if not _should_try_next_model(e):
+                raise
+
+            reason = (
+                "исчерпал лимит"
+                if _is_rate_limit_error(e)
+                else "недоступна для этого ключа"
+            )
+
+            print(
+                f"↪️ {model} {reason}, "
+                "пробуем следующую модель..."
+            )
+
+    if stream is None:
+        raise last_error
 
     full_text = ""
 
@@ -1914,7 +2028,7 @@ async def main():
     )
 
     print(
-        f"🧠 Gemini model: {GEMINI_MODEL}"
+        f"🧠 Gemini модели (цепочка): {' → '.join(GEMINI_MODELS)}"
     )
 
     print(
@@ -1989,7 +2103,7 @@ async def main():
 
         print(
             "🧠 Gemini: включён, "
-            f"модель: {GEMINI_MODEL}"
+            f"цепочка моделей: {' → '.join(GEMINI_MODELS)}"
         )
 
         try:
@@ -2007,14 +2121,15 @@ async def main():
         except Exception as e:
 
             print(
-                "❌ Gemini self-test FAILED: "
+                "❌ Gemini self-test FAILED "
+                f"(все модели из цепочки не сработали): "
                 f"{repr(e)}"
             )
 
             print(
                 "   Проверь: правильный ли GEMINI_API_KEY, "
-                "доступна ли модель "
-                f"'{GEMINI_MODEL}' для этого ключа, "
+                "доступна ли хотя бы одна из моделей "
+                f"{GEMINI_MODELS} для этого ключа, "
                 "и не блокирует ли Render исходящие "
                 "запросы к generativelanguage.googleapis.com."
             )

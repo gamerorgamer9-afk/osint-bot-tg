@@ -11,7 +11,7 @@ from google.genai import types
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -46,8 +46,6 @@ client = TelegramClient(
     StringSession(SESSION_STRING),
     API_ID,
     API_HASH,
-
-    # Автоматическое восстановление соединения
     auto_reconnect=True,
     connection_retries=10,
     retry_delay=5,
@@ -55,13 +53,15 @@ client = TelegramClient(
 
 
 # ============================================================
-# GEMINI
+# GEMINI CLIENT
 # ============================================================
 
 ai_client = None
 
 if GEMINI_API_KEY:
-    ai_client = genai.Client(api_key=GEMINI_API_KEY)
+    ai_client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
 
 
 # ============================================================
@@ -73,6 +73,7 @@ bot_state = {
     "afk_reason": "",
     "afk_messages": [],
 
+    # None / catgirl / tsundere
     "mode": None,
 
     "spam_active": False,
@@ -80,100 +81,71 @@ bot_state = {
 }
 
 
-# Последние сообщения для отслеживания удалений
+# ============================================================
+# MESSAGE CACHE
+# ============================================================
+
 msg_cache = deque(maxlen=500)
 
 
 # ============================================================
-# WEB SERVER FOR RENDER
+# PERSONALITY SYSTEM
 # ============================================================
 
-async def handle_root(request):
-    return web.Response(
-        text="Telegram Userbot is running.",
-        content_type="text/plain"
-    )
+def get_personality_instruction():
+    mode = bot_state.get("mode")
 
+    if mode == "catgirl":
+        return """
+Ты — милая аниме-котодевочка.
 
-async def handle_health(request):
-    connected = client.is_connected()
+Твоя манера общения:
+- дружелюбная;
+- милая;
+- немного игривая;
+- естественная, без чрезмерного переигрывания.
 
-    return web.json_response({
-        "status": "ok",
-        "telegram_connected": connected,
-        "gemini_configured": ai_client is not None,
-    })
+Иногда можешь использовать "ня", "мяу", "мур" и похожие выражения,
+но НЕ используй их в каждом предложении.
 
+Не описывай свои действия в *звёздочках*, если пользователь этого не просит.
 
-async def start_web_server():
-    app = web.Application()
+Главное — отвечай по существу и сохраняй смысл вопроса пользователя.
+"""
 
-    app.router.add_get("/", handle_root)
-    app.router.add_get("/health", handle_health)
+    if mode == "tsundere":
+        return """
+Ты — персонаж цундере.
 
-    runner = web.AppRunner(app)
-    await runner.setup()
+Твоя манера общения:
+- немного дерзкая;
+- слегка раздражённая;
+- иногда застенчивая;
+- иногда делаешь вид, что тебе всё равно.
 
-    site = web.TCPSite(
-        runner,
-        host="0.0.0.0",
-        port=PORT
-    )
+Можешь иногда использовать типичные цундере-фразы вроде:
+"б-бука", "не подумай, что я стараюсь ради тебя",
+"я просто так ответила".
 
-    await site.start()
+Но НЕ используй такие фразы постоянно.
 
-    print(f"🌐 Web server запущен на порту {PORT}")
+Несмотря на характер, всегда отвечай полезно и по существу.
+Не превращай каждый ответ в карикатуру.
+"""
 
-    return runner
+    return """
+Отвечай обычным нейтральным стилем.
 
-
-# ============================================================
-# OPTIONAL SELF-PING
-# ============================================================
-
-async def self_ping_loop():
-    """
-    Дополнительный self-ping.
-
-    ВАЖНО:
-    На бесплатном Render это НЕ является гарантией
-    постоянной работы сервиса.
-    """
-
-    if not RENDER_EXTERNAL_URL:
-        print("ℹ️ RENDER_EXTERNAL_URL не установлен — self-ping отключён")
-        return
-
-    print(f"🔄 Self-ping включён: {RENDER_EXTERNAL_URL}")
-
-    timeout = 20
-
-    async with ClientSession() as session:
-        while True:
-            try:
-                await asyncio.sleep(10 * 60)
-
-                async with session.get(
-                    RENDER_EXTERNAL_URL,
-                    timeout=timeout
-                ) as response:
-
-                    print(
-                        f"🔄 Self-ping: HTTP {response.status}"
-                    )
-
-            except asyncio.CancelledError:
-                break
-
-            except Exception as e:
-                print(
-                    f"⚠️ Self-ping ошибка: "
-                    f"{type(e).__name__}: {e}"
-                )
+Будь:
+- понятным;
+- кратким;
+- естественным;
+- полезным.
+"""
 
 
 # ============================================================
-# GEMINI
+# GEMINI NORMAL GENERATION
 # ============================================================
 
 async def fast_gemini_generate(
@@ -184,14 +156,21 @@ async def fast_gemini_generate(
     if not ai_client:
         return "❌ GEMINI_API_KEY не настроен."
 
+    personality = get_personality_instruction()
+
+    final_instruction = (
+        system_instruction
+        or "Отвечай максимально понятно и по существу."
+    )
+
+    final_instruction += "\n\n" + personality
+
     try:
+
         config = types.GenerateContentConfig(
-            system_instruction=(
-                system_instruction
-                or "Отвечай максимально кратко, понятно и по существу."
-            ),
+            system_instruction=final_instruction,
             max_output_tokens=350,
-            temperature=0.5,
+            temperature=0.7,
         )
 
         response = await ai_client.aio.models.generate_content(
@@ -203,35 +182,134 @@ async def fast_gemini_generate(
         return response.text or "❌ Gemini вернул пустой ответ."
 
     except Exception as e:
+
         print(
             f"❌ Gemini error: "
             f"{type(e).__name__}: {e}"
         )
 
-        return f"❌ Ошибка Gemini: {e}"
+        return f"❌ Ошибка Gemini: {str(e)[:500]}"
 
 
 # ============================================================
-# DEBUG / MESSAGE CACHE
+# RENDER WEB SERVER
+# ============================================================
+
+async def handle_root(request):
+    return web.Response(
+        text="Telegram Userbot is running.",
+        content_type="text/plain"
+    )
+
+
+async def handle_health(request):
+
+    return web.json_response({
+        "status": "ok",
+        "telegram_connected": client.is_connected(),
+        "gemini_configured": ai_client is not None,
+        "mode": bot_state.get("mode"),
+    })
+
+
+async def start_web_server():
+
+    app = web.Application()
+
+    app.router.add_get("/", handle_root)
+    app.router.add_get("/health", handle_health)
+
+    runner = web.AppRunner(app)
+
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        PORT
+    )
+
+    await site.start()
+
+    print(
+        f"🌐 Web server запущен на порту {PORT}"
+    )
+
+    return runner
+
+
+# ============================================================
+# RENDER SELF PING
+# ============================================================
+
+async def self_ping_loop():
+
+    if not RENDER_EXTERNAL_URL:
+
+        print(
+            "ℹ️ RENDER_EXTERNAL_URL не установлен. "
+            "Self-ping отключён."
+        )
+
+        return
+
+    print(
+        f"🔄 Self-ping включён: "
+        f"{RENDER_EXTERNAL_URL}"
+    )
+
+    async with ClientSession() as session:
+
+        while True:
+
+            try:
+
+                await asyncio.sleep(600)
+
+                async with session.get(
+                    RENDER_EXTERNAL_URL,
+                    timeout=20
+                ) as response:
+
+                    print(
+                        f"🔄 Self-ping: HTTP "
+                        f"{response.status}"
+                    )
+
+            except asyncio.CancelledError:
+                break
+
+            except Exception as e:
+
+                print(
+                    f"⚠️ Self-ping ошибка: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+
+# ============================================================
+# MESSAGE LISTENER / DEBUG
 # ============================================================
 
 @client.on(events.NewMessage)
-async def message_debug_and_cache(event):
+async def message_listener(event):
 
     try:
-        # DEBUG LOG
+
+        text = event.raw_text or ""
+
         print(
             f"📩 MESSAGE | "
             f"chat={event.chat_id} | "
             f"outgoing={event.out} | "
-            f"text={repr(event.raw_text[:100])}"
+            f"text={repr(text[:100])}"
         )
 
-        # CACHE
         if event.message and event.message.text:
             msg_cache.append(event.message)
 
     except Exception as e:
+
         print(
             f"⚠️ Message listener error: "
             f"{type(e).__name__}: {e}"
@@ -255,6 +333,7 @@ async def deleted_logger(event):
                     continue
 
                 try:
+
                     sender = await cached.get_sender()
 
                     sender_name = (
@@ -263,7 +342,10 @@ async def deleted_logger(event):
                         or "Неизвестно"
                     )
 
-                    text = cached.text or "[без текста]"
+                    text = (
+                        cached.text
+                        or "[без текста]"
+                    )
 
                     log_text = (
                         "🗑 **Удалено сообщение!**\n\n"
@@ -278,6 +360,7 @@ async def deleted_logger(event):
                     )
 
                 except Exception as e:
+
                     print(
                         f"⚠️ Ошибка логирования удаления: "
                         f"{type(e).__name__}: {e}"
@@ -286,6 +369,7 @@ async def deleted_logger(event):
                 break
 
     except Exception as e:
+
         print(
             f"⚠️ MessageDeleted error: "
             f"{type(e).__name__}: {e}"
@@ -293,7 +377,7 @@ async def deleted_logger(event):
 
 
 # ============================================================
-# PING
+# .PING
 # ============================================================
 
 @client.on(
@@ -309,7 +393,10 @@ async def ping_handler(event):
     start = time.perf_counter()
 
     try:
-        await event.edit("🏓 Pinging...")
+
+        await event.edit(
+            "🏓 Pinging..."
+        )
 
         elapsed = round(
             (time.perf_counter() - start) * 1000,
@@ -322,6 +409,7 @@ async def ping_handler(event):
         )
 
     except Exception as e:
+
         print(
             f"❌ Ping error: "
             f"{type(e).__name__}: {e}"
@@ -329,7 +417,7 @@ async def ping_handler(event):
 
 
 # ============================================================
-# HELP
+# .HELP
 # ============================================================
 
 @client.on(
@@ -345,28 +433,33 @@ async def help_handler(event):
     help_text = (
         "⚙️ **Юзербот — команды**\n\n"
 
-        "🏓 `.ping` — проверка работы\n"
+        "🏓 `.ping` — проверить работу\n"
         "📚 `.help` — список команд\n\n"
 
         "💤 `.afk [причина]` — включить AFK\n"
         "🌅 `.unafk` — выключить AFK\n\n"
 
-        "🧠 `.ai [текст]` — Gemini\n"
-        "📝 `.remember [кол-во]` — саммари чата\n"
-        "🎭 `.clone` — копирование стиля\n\n"
+        "🧠 `.ai [текст]` — Gemini AI\n"
+        "📝 `.remember [число]` — саммари чата\n"
+        "🎭 `.clone` — скопировать стиль\n\n"
 
-        "😺 `.catgirl` — режим catgirl\n"
-        "😤 `.tsundere` — режим tsundere\n"
-        "🔄 `.reset` — сброс режима\n\n"
+        "🐱 `.catgirl` — режим котодевочки\n"
+        "😤 `.tsundere` — режим цундере\n"
+        "🔄 `.reset` — обычный режим\n"
+        "🎭 `.mode` — показать режим\n\n"
 
-        "📨 `.spam [кол-во] [текст]`\n"
+        "📨 `.spam [количество] [текст]`\n"
         "⏹ `.stop` — остановить spam"
     )
 
     try:
-        await event.edit(help_text)
+
+        await event.edit(
+            help_text
+        )
 
     except Exception as e:
+
         print(
             f"❌ Help error: "
             f"{type(e).__name__}: {e}"
@@ -394,7 +487,9 @@ async def afk_on(event):
     bot_state["afk_reason"] = reason
     bot_state["afk_messages"] = []
 
-    print(f"💤 AFK ON: {reason}")
+    print(
+        f"💤 AFK ON: {reason}"
+    )
 
     await event.edit(
         f"💤 **Режим AFK включен.**\n"
@@ -415,9 +510,11 @@ async def afk_on(event):
 async def afk_off(event):
 
     if not bot_state["afk"]:
+
         await event.edit(
             "❌ Вы не находитесь в AFK."
         )
+
         return
 
     count = len(
@@ -438,13 +535,20 @@ async def afk_off(event):
 # AFK LISTENER
 # ============================================================
 
-@client.on(events.NewMessage(incoming=True))
+@client.on(
+    events.NewMessage(
+        incoming=True
+    )
+)
 async def afk_listener(event):
 
     if not bot_state["afk"]:
         return
 
-    if not (event.is_private or event.mentioned):
+    if not (
+        event.is_private
+        or event.mentioned
+    ):
         return
 
     try:
@@ -457,7 +561,10 @@ async def afk_listener(event):
             or "Кто-то"
         )
 
-        text = event.raw_text or "[без текста]"
+        text = (
+            event.raw_text
+            or "[без текста]"
+        )
 
         bot_state["afk_messages"].append(
             f"{name}: {text}"
@@ -469,6 +576,7 @@ async def afk_listener(event):
         )
 
     except Exception as e:
+
         print(
             f"❌ AFK error: "
             f"{type(e).__name__}: {e}"
@@ -476,7 +584,7 @@ async def afk_listener(event):
 
 
 # ============================================================
-# GEMINI AI
+# .AI
 # ============================================================
 
 @client.on(
@@ -489,28 +597,44 @@ async def ai_handler(event):
 
     prompt = event.pattern_match.group(1)
 
-    print(f"🧠 AI request: {prompt[:100]}")
+    mode = bot_state.get("mode")
+
+    print(
+        f"🧠 AI request | "
+        f"mode={mode} | "
+        f"prompt={prompt[:100]}"
+    )
 
     if not ai_client:
+
         await event.edit(
             "❌ `GEMINI_API_KEY` не настроен."
         )
+
         return
+
+    personality = get_personality_instruction()
 
     try:
 
-        await event.edit("🧠 *Генерация...*")
+        await event.edit(
+            "🧠 *Генерация...*"
+        )
 
-        response = await ai_client.aio.models.generate_content_stream(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                max_output_tokens=400,
-                temperature=0.6,
+        response = (
+            await ai_client.aio.models.generate_content_stream(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=personality,
+                    max_output_tokens=400,
+                    temperature=0.7,
+                )
             )
         )
 
         full_text = ""
+
         last_update = time.time()
 
         async for chunk in response:
@@ -520,23 +644,31 @@ async def ai_handler(event):
 
             full_text += chunk.text
 
-            # Не редактируем слишком часто
             if (
                 time.time() - last_update >= 1.5
                 and full_text
             ):
+
                 try:
+
                     await event.edit(
                         full_text + " ▌"
                     )
+
                     last_update = time.time()
+
                 except Exception:
                     pass
 
         if not full_text:
-            full_text = "❌ Gemini не вернул текст."
 
-        await event.edit(full_text)
+            full_text = (
+                "❌ Gemini не вернул текст."
+            )
+
+        await event.edit(
+            full_text
+        )
 
     except Exception as e:
 
@@ -546,168 +678,8 @@ async def ai_handler(event):
         )
 
         await event.edit(
-            f"❌ Ошибка Gemini:\n`{str(e)[:500]}`"
-        )
-
-
-# ============================================================
-# REMEMBER
-# ============================================================
-
-@client.on(
-    events.NewMessage(
-        outgoing=True,
-        pattern=r"^\.remember(?:\s+(\d+))?$"
-    )
-)
-async def remember_handler(event):
-
-    try:
-
-        limit = int(
-            event.pattern_match.group(1)
-            or 25
-        )
-
-        # Защита от слишком больших запросов
-        limit = max(1, min(limit, 100))
-
-        await event.edit(
-            f"📊 Анализирую последние `{limit}` сообщений..."
-        )
-
-        raw_messages = await client.get_messages(
-            event.chat_id,
-            limit=limit
-        )
-
-        history = []
-
-        for message in reversed(raw_messages):
-
-            if not message.text:
-                continue
-
-            try:
-                sender = await message.get_sender()
-
-                name = (
-                    getattr(sender, "first_name", None)
-                    or getattr(sender, "username", None)
-                    or "User"
-                )
-
-            except Exception:
-                name = "User"
-
-            history.append(
-                f"{name}: {message.text}"
-            )
-
-        if not history:
-            await event.edit(
-                "❌ Не удалось найти текстовые сообщения."
-            )
-            return
-
-        context_text = "\n".join(history)
-
-        prompt = (
-            "Сделай краткое и понятное саммари "
-            "этой переписки на русском языке.\n\n"
-            f"{context_text}"
-        )
-
-        result = await fast_gemini_generate(prompt)
-
-        await event.edit(
-            f"📝 **Краткая выжимка:**\n\n{result}"
-        )
-
-    except Exception as e:
-
-        print(
-            f"❌ Remember error: "
-            f"{type(e).__name__}: {e}"
-        )
-
-        await event.edit(
-            f"❌ Ошибка: `{str(e)[:500]}`"
-        )
-
-
-# ============================================================
-# CLONE
-# ============================================================
-
-@client.on(
-    events.NewMessage(
-        outgoing=True,
-        pattern=r"^\.clone$"
-    )
-)
-async def clone_handler(event):
-
-    try:
-
-        reply = await event.get_reply_message()
-
-        if not reply or not reply.sender_id:
-            await event.edit(
-                "❌ Используй `.clone` ответом "
-                "на сообщение пользователя."
-            )
-            return
-
-        await event.edit(
-            "🎭 Анализирую манеру речи..."
-        )
-
-        messages = await client.get_messages(
-            event.chat_id,
-            limit=40,
-            from_user=reply.sender_id
-        )
-
-        texts = [
-            m.text
-            for m in messages
-            if m.text
-        ]
-
-        if not texts:
-            await event.edit(
-                "❌ Недостаточно сообщений "
-                "для анализа."
-            )
-            return
-
-        sample = "\n".join(
-            texts[:15]
-        )
-
-        prompt = (
-            "Проанализируй стиль автора "
-            "по примерам ниже и напиши одно "
-            "короткое предложение в похожем стиле. "
-            "Сохрани характерную пунктуацию, "
-            "сленг и манеру речи.\n\n"
-            f"{sample}"
-        )
-
-        result = await fast_gemini_generate(prompt)
-
-        await event.edit(result)
-
-    except Exception as e:
-
-        print(
-            f"❌ Clone error: "
-            f"{type(e).__name__}: {e}"
-        )
-
-        await event.edit(
-            f"❌ Ошибка: `{str(e)[:500]}`"
+            f"❌ Ошибка Gemini:\n"
+            f"`{str(e)[:500]}`"
         )
 
 
@@ -725,25 +697,290 @@ async def mode_handler(event):
 
     command = event.pattern_match.group(1)
 
+    if command == "catgirl":
+
+        bot_state["mode"] = "catgirl"
+
+        await event.edit(
+            "🐱 **Режим котодевочки активирован!**\n\n"
+            "Теперь `.ai` будет отвечать "
+            "в стиле милой аниме-котодевочки."
+        )
+
+        print(
+            "🐱 MODE = CATGIRL"
+        )
+
+        return
+
+    if command == "tsundere":
+
+        bot_state["mode"] = "tsundere"
+
+        await event.edit(
+            "😤 **Режим цундере активирован!**\n\n"
+            "Теперь `.ai` будет отвечать "
+            "в стиле цундере."
+        )
+
+        print(
+            "😤 MODE = TSUNDERE"
+        )
+
+        return
+
     if command == "reset":
 
         bot_state["mode"] = None
 
         await event.edit(
-            "🔄 Режим личности сброшен."
+            "🔄 **Режим личности сброшен.**\n\n"
+            "Теперь `.ai` использует обычный стиль."
         )
 
-        return
+        print(
+            "🔄 MODE = NORMAL"
+        )
 
-    bot_state["mode"] = command
+
+# ============================================================
+# .MODE
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.mode$"
+    )
+)
+async def mode_status(event):
+
+    mode = bot_state.get("mode")
+
+    if mode == "catgirl":
+
+        text = (
+            "🐱 Сейчас активен режим "
+            "**котодевочки**."
+        )
+
+    elif mode == "tsundere":
+
+        text = (
+            "😤 Сейчас активен режим "
+            "**цундере**."
+        )
+
+    else:
+
+        text = (
+            "🔄 Сейчас активен "
+            "**обычный режим**."
+        )
 
     await event.edit(
-        f"🎭 Режим **{command}** активирован!"
+        text
     )
 
 
 # ============================================================
-# SPAM
+# .REMEMBER
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.remember(?:\s+(\d+))?$"
+    )
+)
+async def remember_handler(event):
+
+    try:
+
+        limit = int(
+            event.pattern_match.group(1)
+            or 25
+        )
+
+        limit = max(
+            1,
+            min(limit, 100)
+        )
+
+        await event.edit(
+            f"📊 Анализирую последние "
+            f"`{limit}` сообщений..."
+        )
+
+        raw_messages = await client.get_messages(
+            event.chat_id,
+            limit=limit
+        )
+
+        history = []
+
+        for message in reversed(
+            raw_messages
+        ):
+
+            if not message.text:
+                continue
+
+            try:
+
+                sender = await message.get_sender()
+
+                name = (
+                    getattr(
+                        sender,
+                        "first_name",
+                        None
+                    )
+                    or getattr(
+                        sender,
+                        "username",
+                        None
+                    )
+                    or "User"
+                )
+
+            except Exception:
+
+                name = "User"
+
+            history.append(
+                f"{name}: {message.text}"
+            )
+
+        if not history:
+
+            await event.edit(
+                "❌ Не удалось найти "
+                "текстовые сообщения."
+            )
+
+            return
+
+        context_text = "\n".join(
+            history
+        )
+
+        prompt = (
+            "Сделай краткое и понятное "
+            "саммари этой переписки "
+            "на русском языке.\n\n"
+            f"{context_text}"
+        )
+
+        result = await fast_gemini_generate(
+            prompt
+        )
+
+        await event.edit(
+            f"📝 **Краткая выжимка:**\n\n"
+            f"{result}"
+        )
+
+    except Exception as e:
+
+        print(
+            f"❌ Remember error: "
+            f"{type(e).__name__}: {e}"
+        )
+
+        await event.edit(
+            f"❌ Ошибка:\n"
+            f"`{str(e)[:500]}`"
+        )
+
+
+# ============================================================
+# .CLONE
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.clone$"
+    )
+)
+async def clone_handler(event):
+
+    try:
+
+        reply = await event.get_reply_message()
+
+        if not reply or not reply.sender_id:
+
+            await event.edit(
+                "❌ Используй `.clone` "
+                "ответом на сообщение пользователя."
+            )
+
+            return
+
+        await event.edit(
+            "🎭 Анализирую манеру речи..."
+        )
+
+        messages = await client.get_messages(
+            event.chat_id,
+            limit=40,
+            from_user=reply.sender_id
+        )
+
+        texts = [
+            message.text
+            for message in messages
+            if message.text
+        ]
+
+        if not texts:
+
+            await event.edit(
+                "❌ Недостаточно сообщений "
+                "для анализа."
+            )
+
+            return
+
+        sample = "\n".join(
+            texts[:15]
+        )
+
+        prompt = (
+            "Проанализируй стиль автора "
+            "по следующим сообщениям.\n\n"
+            "Затем напиши одно короткое "
+            "предложение в похожей манере.\n\n"
+            "Сохрани характерную пунктуацию, "
+            "сленг и стиль.\n\n"
+            f"{sample}"
+        )
+
+        result = await fast_gemini_generate(
+            prompt
+        )
+
+        await event.edit(
+            result
+        )
+
+    except Exception as e:
+
+        print(
+            f"❌ Clone error: "
+            f"{type(e).__name__}: {e}"
+        )
+
+        await event.edit(
+            f"❌ Ошибка:\n"
+            f"`{str(e)[:500]}`"
+        )
+
+
+# ============================================================
+# .SPAM
 # ============================================================
 
 @client.on(
@@ -762,18 +999,22 @@ async def spam_handler(event):
 
         text = event.pattern_match.group(2)
 
-        # Разумный предел
-        count = max(1, min(count, 100))
+        # Ограничение
+        count = max(
+            1,
+            min(count, 100)
+        )
 
-        # Останавливаем старую задачу
-        if bot_state["spam_task"]:
+        # Останавливаем предыдущую задачу
+        old_task = bot_state.get(
+            "spam_task"
+        )
+
+        if old_task and not old_task.done():
 
             bot_state["spam_active"] = False
 
-            try:
-                await bot_state["spam_task"]
-            except Exception:
-                pass
+            old_task.cancel()
 
         await event.delete()
 
@@ -783,9 +1024,11 @@ async def spam_handler(event):
 
             try:
 
-                for i in range(count):
+                for _ in range(count):
 
-                    if not bot_state["spam_active"]:
+                    if not bot_state[
+                        "spam_active"
+                    ]:
                         break
 
                     await client.send_message(
@@ -793,9 +1036,12 @@ async def spam_handler(event):
                         text
                     )
 
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(
+                        0.5
+                    )
 
             except asyncio.CancelledError:
+
                 pass
 
             except Exception as e:
@@ -825,7 +1071,7 @@ async def spam_handler(event):
 
 
 # ============================================================
-# STOP SPAM
+# .STOP
 # ============================================================
 
 @client.on(
@@ -838,9 +1084,12 @@ async def stop_spam(event):
 
     bot_state["spam_active"] = False
 
-    task = bot_state.get("spam_task")
+    task = bot_state.get(
+        "spam_task"
+    )
 
     if task and not task.done():
+
         task.cancel()
 
     bot_state["spam_task"] = None
@@ -848,17 +1097,6 @@ async def stop_spam(event):
     await event.edit(
         "⏹ **Процесс остановлен.**"
     )
-
-
-# ============================================================
-# TELEGRAM CONNECTION LOGGING
-# ============================================================
-
-@client.on(events.Raw)
-async def raw_update_debug(event):
-    # Специально ничего не выводим,
-    # чтобы не засорять Render Logs.
-    pass
 
 
 # ============================================================
@@ -871,66 +1109,96 @@ async def main():
     print("🚀 ЗАПУСК TELEGRAM USERBOT")
     print("=" * 60)
 
-    print(f"🔧 API_ID: {API_ID}")
-    print(f"🔧 API_HASH: {'OK' if API_HASH else 'MISSING'}")
     print(
-        f"🔧 SESSION_STRING: "
+        f"🔧 API_ID: {API_ID}"
+    )
+
+    print(
+        "🔧 API_HASH: "
+        f"{'OK' if API_HASH else 'MISSING'}"
+    )
+
+    print(
+        "🔧 SESSION_STRING: "
         f"{'OK' if SESSION_STRING else 'MISSING'}"
     )
+
     print(
-        f"🔧 GEMINI: "
+        "🔧 GEMINI: "
         f"{'OK' if ai_client else 'DISABLED'}"
     )
 
-    # Запускаем HTTP-сервер
+    # Render HTTP server
     await start_web_server()
 
-    # Дополнительный self-ping
+    # Self-ping
     asyncio.create_task(
         self_ping_loop()
     )
 
-    # ========================================================
-    # TELEGRAM
-    # ========================================================
-
+    # Telegram
     try:
 
-        print("🔌 Подключение к Telegram...")
+        print(
+            "🔌 Подключение к Telegram..."
+        )
 
         await client.start()
 
-        # Проверяем, кто авторизован
         me = await client.get_me()
 
         print("=" * 60)
-        print("✅ TELEGRAM УСПЕШНО ПОДКЛЮЧЕН")
-        print(f"👤 Имя: {me.first_name}")
-        print(f"🆔 ID: {me.id}")
         print(
-            f"📛 Username: "
-            f"@{me.username}"
-            if me.username
-            else "📛 Username: отсутствует"
+            "✅ TELEGRAM УСПЕШНО ПОДКЛЮЧЕН"
         )
+
+        print(
+            f"👤 Имя: {me.first_name}"
+        )
+
+        print(
+            f"🆔 ID: {me.id}"
+        )
+
+        if me.username:
+
+            print(
+                f"📛 Username: @{me.username}"
+            )
+
+        else:
+
+            print(
+                "📛 Username: отсутствует"
+            )
+
         print("=" * 60)
 
-        print("👂 Ожидаю команды...")
-        print("👉 Попробуй отправить: .ping")
+        print(
+            "👂 Ожидаю команды..."
+        )
 
-        # Главный цикл Telethon
+        print(
+            "👉 Попробуй отправить: .ping"
+        )
+
         await client.run_until_disconnected()
 
     except Exception as e:
 
         print("=" * 60)
-        print("❌ КРИТИЧЕСКАЯ ОШИБКА TELEGRAM")
+        print(
+            "❌ КРИТИЧЕСКАЯ ОШИБКА TELEGRAM"
+        )
+
         print(
             f"Тип: {type(e).__name__}"
         )
+
         print(
             f"Ошибка: {e}"
         )
+
         print("=" * 60)
 
         raise
@@ -943,12 +1211,17 @@ async def main():
 if __name__ == "__main__":
 
     try:
+
         asyncio.run(main())
 
     except KeyboardInterrupt:
-        print("🛑 Остановлено пользователем.")
+
+        print(
+            "🛑 Остановлено пользователем."
+        )
 
     except Exception as e:
+
         print(
             f"💥 Application crashed: "
             f"{type(e).__name__}: {e}"

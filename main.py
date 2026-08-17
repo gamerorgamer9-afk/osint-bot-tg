@@ -23,10 +23,17 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 PORT = int(os.environ.get("PORT", "8080"))
 
 # Можно поменять модель через Render Environment Variables.
-# Сейчас используется Gemini 3.6 Flash.
+#
+# gemini-3.6-flash — новее, но на бесплатном тарифе
+# у неё очень маленькая квота (в логах было "limit: 20"),
+# из-за чего .catgirl/.tsundere/.clone/.remember быстро
+# упирались в 429 RESOURCE_EXHAUSTED.
+#
+# gemini-2.5-flash — стабильная модель с гораздо более
+# щедрым бесплатным лимитом, используем её по умолчанию.
 GEMINI_MODEL = os.environ.get(
     "GEMINI_MODEL",
-    "gemini-3.6-flash"
+    "gemini-2.5-flash"
 )
 
 
@@ -468,6 +475,53 @@ def clean_ai_text(text: str) -> str:
 
 
 # ============================================================
+# RETRY ON 429 (RATE LIMIT)
+# ============================================================
+
+def _is_rate_limit_error(e: Exception) -> bool:
+
+    msg = str(e)
+
+    return (
+        "429" in msg
+        or "RESOURCE_EXHAUSTED" in msg
+        or "quota" in msg.lower()
+    )
+
+
+async def _with_retry(coro_factory, retries: int = 2, base_delay: float = 2.0):
+
+    # coro_factory — функция БЕЗ аргументов, возвращающая
+    # новую корутину при каждом вызове (нужно для повторных попыток).
+
+    last_error = None
+
+    for attempt in range(retries + 1):
+
+        try:
+
+            return await coro_factory()
+
+        except Exception as e:
+
+            last_error = e
+
+            if not _is_rate_limit_error(e) or attempt == retries:
+                raise
+
+            delay = base_delay * (2 ** attempt)
+
+            print(
+                f"⏳ Gemini 429, повтор через {delay:.0f}с "
+                f"(попытка {attempt + 1}/{retries})"
+            )
+
+            await asyncio.sleep(delay)
+
+    raise last_error
+
+
+# ============================================================
 # FAST GEMINI GENERATION
 # ============================================================
 
@@ -494,23 +548,27 @@ async def gemini_generate(
 
     )
 
-    async with gemini_semaphore:
+    async def _call():
 
-        response = await asyncio.wait_for(
+        async with gemini_semaphore:
 
-            ai_client.aio.models.generate_content(
+            return await asyncio.wait_for(
 
-                model=GEMINI_MODEL,
+                ai_client.aio.models.generate_content(
 
-                contents=prompt,
+                    model=GEMINI_MODEL,
 
-                config=config
+                    contents=prompt,
 
-            ),
+                    config=config
 
-            timeout=12
+                ),
 
-        )
+                timeout=12
+
+            )
+
+    response = await _with_retry(_call)
 
     return clean_ai_text(
         response.text or ""
@@ -544,39 +602,45 @@ async def gemini_stream(
 
     )
 
-    async with gemini_semaphore:
+    async def _open_stream():
 
-        stream = await asyncio.wait_for(
+        async with gemini_semaphore:
 
-            ai_client.aio.models.generate_content_stream(
+            return await asyncio.wait_for(
 
-                model=GEMINI_MODEL,
+                ai_client.aio.models.generate_content_stream(
 
-                contents=prompt,
+                    model=GEMINI_MODEL,
 
-                config=config
+                    contents=prompt,
 
-            ),
+                    config=config
 
-            timeout=12
+                ),
 
-        )
+                timeout=12
 
-        full_text = ""
+            )
 
-        async for chunk in stream:
+    # Ретраим только открытие стрима (сам 429 прилетает
+    # именно на этом шаге, до получения первых чанков).
+    stream = await _with_retry(_open_stream)
 
-            try:
-                piece = chunk.text
-            except Exception:
-                piece = None
+    full_text = ""
 
-            if not piece:
-                continue
+    async for chunk in stream:
 
-            full_text += piece
+        try:
+            piece = chunk.text
+        except Exception:
+            piece = None
 
-            yield clean_ai_text(full_text)
+        if not piece:
+            continue
+
+        full_text += piece
+
+        yield clean_ai_text(full_text)
 
 
 # ============================================================

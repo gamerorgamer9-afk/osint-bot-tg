@@ -1401,6 +1401,23 @@ async def personality_rewriter(event):
         except Exception:
             pass
 
+        # Раньше ошибка была видна только в логах Render,
+        # из-за чего казалось, что .catgirl/.tsundere
+        # "просто не работают". Теперь дублируем её
+        # в Избранное, чтобы было видно прямо в Telegram.
+
+        try:
+
+            await client.send_message(
+                "me",
+                "⚠️ **Personality rewriter error**\n"
+                f"Mode: `{original_mode}`\n"
+                f"Error: `{repr(e)[:500]}`"
+            )
+
+        except Exception:
+            pass
+
 
 # ============================================================
 # CLONE
@@ -1848,13 +1865,42 @@ async def main():
     if ai_client:
 
         print(
-            "🧠 Gemini: включён"
+            "🧠 Gemini: включён, "
+            f"модель: {GEMINI_MODEL}"
         )
+
+        try:
+
+            test_result = await gemini_generate(
+                "Скажи одно слово: тест",
+                "Отвечай одним словом.",
+                max_tokens=10
+            )
+
+            print(
+                f"✅ Gemini self-test OK: {test_result!r}"
+            )
+
+        except Exception as e:
+
+            print(
+                "❌ Gemini self-test FAILED: "
+                f"{repr(e)}"
+            )
+
+            print(
+                "   Проверь: правильный ли GEMINI_API_KEY, "
+                "доступна ли модель "
+                f"'{GEMINI_MODEL}' для этого ключа, "
+                "и не блокирует ли Render исходящие "
+                "запросы к generativelanguage.googleapis.com."
+            )
 
     else:
 
         print(
-            "⚠️ Gemini: выключен"
+            "⚠️ Gemini: выключен "
+            "(GEMINI_API_KEY не установлен в Render Environment)"
         )
 
 

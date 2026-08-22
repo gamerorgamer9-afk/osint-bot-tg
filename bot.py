@@ -1,5 +1,7 @@
 import asyncio
+import ast
 import logging
+import operator
 import os
 import random
 import re
@@ -1416,6 +1418,119 @@ async def decide_command(event):
 
 
 # ============================================================
+# .MATH
+# ============================================================
+
+# Разрешённые операции для безопасного вычисления выражений —
+# белый список через ast, без eval(). Никаких вызовов функций,
+# имён переменных и т.п. — только числа, +-*/ и скобки.
+_MATH_BINOPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+    ast.Mod: operator.mod,
+}
+
+_MATH_UNARYOPS = {
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def _safe_eval_node(node):
+    if isinstance(node, ast.Constant) and isinstance(
+        node.value, (int, float)
+    ):
+        return node.value
+
+    if isinstance(node, ast.BinOp) and type(node.op) in _MATH_BINOPS:
+        left = _safe_eval_node(node.left)
+        right = _safe_eval_node(node.right)
+        return _MATH_BINOPS[type(node.op)](left, right)
+
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _MATH_UNARYOPS:
+        return _MATH_UNARYOPS[type(node.op)](
+            _safe_eval_node(node.operand)
+        )
+
+    raise ValueError("Недопустимое выражение")
+
+
+def safe_calculate(expr: str) -> float:
+    """
+    Безопасно считает арифметическое выражение (числа, + - * / %,
+    скобки, унарный минус). Понимает ":" и "х"/"x" как деление
+    и умножение соответственно (удобно с русской раскладкой).
+    """
+
+    normalized = (
+        expr.replace(",", ".")
+        .replace(":", "/")
+        .replace("х", "*")
+        .replace("Х", "*")
+        .replace("x", "*")
+        .replace("X", "*")
+    )
+
+    tree = ast.parse(normalized, mode="eval")
+    return _safe_eval_node(tree.body)
+
+
+def format_number(n) -> str:
+    if isinstance(n, float) and n.is_integer():
+        n = int(n)
+
+    if isinstance(n, int):
+        return str(n)
+
+    text = f"{n:.8f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.math(?:\s+([\s\S]+))?$",
+    )
+)
+async def math_command(event):
+    expr = event.pattern_match.group(1)
+
+    if not expr:
+        await event.edit(
+            "Использование: .math 5 + 3\n"
+            "Также понимает : (деление), х/x (умножение) "
+            "и скобки: .math (5 + 3) * 2"
+        )
+        return
+
+    expr = expr.strip().rstrip("=").strip()
+
+    try:
+        result = safe_calculate(expr)
+
+        await event.edit(f"{expr} = {format_number(result)}")
+
+        logger.info(
+            ".math completed | chat=%s | expr=%r | result=%s",
+            event.chat_id,
+            expr,
+            result,
+        )
+
+    except ZeroDivisionError:
+        await event.edit(f"{expr} — на ноль делить нельзя 🙅")
+
+    except Exception:
+        logger.exception(".math: не удалось посчитать %r", expr)
+        await event.edit(
+            "❌ Не понял выражение. Пример: .math 5 + 3"
+        )
+
+
+# ============================================================
 # .STATS
 # ============================================================
 
@@ -1746,6 +1861,7 @@ async def help_command(event):
         ".ai <запрос> — разовый вопрос к DeepSeek",
         ".8ball <вопрос> — магический шар",
         ".decide A или B — выбор с обоснованием",
+        ".math 5 + 3 — калькулятор (+ - * / % : x, скобки)",
         ".stats — статистика переписки (только в личке)",
         ".remember — профиль + шуточный dere-тип "
         "(в личке — собеседник, в группах — ответом на сообщение)",
@@ -2292,6 +2408,7 @@ async def main():
     print(".ai запрос")
     print(".8ball вопрос")
     print(".decide A или B")
+    print(".math 5 + 3")
     print(".stats")
     print(".help")
     print()

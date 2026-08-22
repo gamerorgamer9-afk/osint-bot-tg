@@ -1533,6 +1533,8 @@ async def help_command(event):
         ".ai <запрос> — разовый вопрос к DeepSeek",
         ".remember — профиль + шуточный dere-тип "
         "(в личке — собеседник, в группах — ответом на сообщение)",
+        ".найти <название песни> — найти и прислать трек "
+        f"через @{MUSIC_BOT_USERNAME}",
         ".help — это сообщение",
         "",
         "Стиль в этом чате: "
@@ -1544,6 +1546,146 @@ async def help_command(event):
     ]
 
     await event.edit("\n".join(lines))
+
+
+# ============================================================
+# .НАЙТИ (поиск музыки через @smusic2bot)
+# ============================================================
+
+# Юзернейм бота-посредника для поиска музыки. Можно заменить на
+# любой другой похожий музыкальный бот через .env.
+MUSIC_BOT_USERNAME = os.getenv("MUSIC_BOT_USERNAME", "smusic2bot")
+
+# Сколько секунд ждать список результатов поиска.
+MUSIC_SEARCH_TIMEOUT = int(os.getenv("MUSIC_SEARCH_TIMEOUT", "20"))
+
+# Сколько секунд ждать сам трек после нажатия на результат
+# (обычно дольше — бот его либо качает, либо конвертирует).
+MUSIC_DOWNLOAD_TIMEOUT = int(os.getenv("MUSIC_DOWNLOAD_TIMEOUT", "40"))
+
+
+async def _wait_for_bot_message(username: str, timeout: int):
+    """
+    Ждёт следующее входящее сообщение от конкретного бота.
+    Использует одноразовый обработчик + Future, снимает
+    обработчик по завершении (успех, таймаут или ошибка).
+    """
+
+    loop = asyncio.get_event_loop()
+    future = loop.create_future()
+
+    async def on_message(bot_event):
+        if not future.done():
+            future.set_result(bot_event.message)
+
+    handler = client.add_event_handler(
+        on_message,
+        events.NewMessage(incoming=True, from_users=username),
+    )
+
+    try:
+        return await asyncio.wait_for(future, timeout=timeout)
+    finally:
+        client.remove_event_handler(handler)
+
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.найти(?:\s+([\s\S]+))?$",
+    )
+)
+async def find_music_command(event):
+    query = event.pattern_match.group(1)
+
+    if not query:
+        await event.edit(
+            "Использование: .найти название песни"
+        )
+        return
+
+    query = query.strip()
+    target_chat_id = event.chat_id
+
+    try:
+        await event.edit(f"🔎 Ищу «{query}»...")
+
+        await client.send_message(MUSIC_BOT_USERNAME, query)
+
+        try:
+            result_message = await _wait_for_bot_message(
+                MUSIC_BOT_USERNAME,
+                MUSIC_SEARCH_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            await event.edit(
+                f"❌ @{MUSIC_BOT_USERNAME} не ответил за "
+                f"{MUSIC_SEARCH_TIMEOUT} секунд."
+            )
+            return
+
+        # Бот сначала присылает список результатов с кнопками
+        # ("1. Артист - Название (...)"), а не сразу трек.
+        # Нажимаем на первый (лучший) результат.
+        if not result_message.media and result_message.buttons:
+            await event.edit("🔎 Нашёл варианты, скачиваю первый...")
+
+            try:
+                await result_message.click(0, 0)
+            except Exception:
+                logger.exception(
+                    ".найти: не удалось нажать на первый результат "
+                    "| query=%r",
+                    query,
+                )
+                await event.edit(
+                    "❌ Не удалось выбрать первый результат."
+                )
+                return
+
+            try:
+                result_message = await _wait_for_bot_message(
+                    MUSIC_BOT_USERNAME,
+                    MUSIC_DOWNLOAD_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                await event.edit(
+                    f"❌ Бот не прислал трек за "
+                    f"{MUSIC_DOWNLOAD_TIMEOUT} секунд после выбора."
+                )
+                return
+
+        if result_message.media:
+            await client.send_file(
+                target_chat_id,
+                result_message.media,
+                caption=result_message.text or f"🎵 {query}",
+            )
+            try:
+                await event.delete()
+            except Exception:
+                await event.edit("✅ Готово.")
+        elif result_message.text:
+            # Ни медиа, ни кнопок — вероятно, ошибка/"не найдено".
+            await event.edit(
+                "ℹ️ Ответ бота:\n\n" + result_message.text
+            )
+        else:
+            await event.edit(
+                "❌ Не удалось получить трек — пустой ответ."
+            )
+
+        logger.info(
+            ".найти completed | chat=%s | query=%r",
+            target_chat_id,
+            query,
+        )
+
+    except Exception:
+        logger.exception("Ошибка .найти | query=%r", query)
+        await event.edit(
+            "❌ Ошибка поиска музыки. Смотри logs/userbot.log"
+        )
 
 
 # ============================================================
@@ -2073,6 +2215,7 @@ async def main():
     print(".unmute")
     print(".remember")
     print(".ai запрос")
+    print(f".найти <название песни> (через @{MUSIC_BOT_USERNAME})")
     print(".help")
     print()
     print(

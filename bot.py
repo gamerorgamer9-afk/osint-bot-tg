@@ -10,9 +10,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from telethon import TelegramClient, events, functions, types
-from telethon.errors import FloodWaitError, UserAlreadyParticipantError
-from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 
 try:
@@ -1284,6 +1282,190 @@ async def ai_command(event):
 
 
 # ============================================================
+# .8BALL
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.8ball(?:\s+([\s\S]+))?$",
+    )
+)
+async def eightball_command(event):
+    question = event.pattern_match.group(1)
+
+    if not question:
+        await event.edit(
+            "Использование: .8ball вопрос"
+        )
+        return
+
+    try:
+        await event.edit("🎱 ...")
+
+        prompt = f"""
+Ты — классический "магический шар" (Magic 8-Ball). Тебе задают
+вопрос, ты отвечаешь ОДНОЙ короткой загадочной фразой в духе
+классических ответов шара: "Да", "Нет", "Определённо да",
+"Спроси позже", "Даже не думай", "Знаки говорят да", "Сконцентрируйся
+и спроси снова", "Мой ответ — нет", "Весьма сомнительно" и подобные.
+
+Не объясняй, не рассуждай, не задавай встречных вопросов — только
+одна короткая фраза-ответ, без кавычек.
+
+Вопрос: {question}
+"""
+
+        answer = await ask_ai(prompt)
+
+        await event.edit(f"🎱 {answer}")
+
+        logger.info(
+            ".8ball completed | chat=%s | question=%r",
+            event.chat_id,
+            question,
+        )
+
+    except Exception:
+        logger.exception("Ошибка .8ball")
+        await event.edit(
+            "❌ Ошибка DeepSeek. "
+            "Смотри logs/userbot.log"
+        )
+
+
+# ============================================================
+# .DECIDE
+# ============================================================
+
+DECIDE_SPLIT_RE = re.compile(r"\s+или\s+", re.IGNORECASE)
+
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.decide(?:\s+([\s\S]+))?$",
+    )
+)
+async def decide_command(event):
+    raw = event.pattern_match.group(1)
+
+    if not raw:
+        await event.edit(
+            "Использование: .decide вариант1 или вариант2"
+        )
+        return
+
+    parts = DECIDE_SPLIT_RE.split(raw.strip(), maxsplit=1)
+
+    if len(parts) < 2 or not parts[0].strip() or not parts[1].strip():
+        await event.edit(
+            "Использование: .decide вариант1 или вариант2\n"
+            "(раздели варианты словом «или»)"
+        )
+        return
+
+    option_a, option_b = parts[0].strip(), parts[1].strip()
+
+    try:
+        await event.edit("🎲 Выбираю...")
+
+        prompt = f"""
+Выбери ОДИН из двух вариантов ниже и коротко (1-2 предложения)
+объясни выбор с остроумием и уверенностью — без занудства,
+без "это зависит от...", без предложения обоих вариантов сразу.
+Нужен один чёткий выбор.
+
+Вариант A: {option_a}
+Вариант B: {option_b}
+"""
+
+        answer = await ask_ai(prompt)
+
+        await event.edit(f"🎲 {answer}")
+
+        logger.info(
+            ".decide completed | chat=%s | a=%r | b=%r",
+            event.chat_id,
+            option_a,
+            option_b,
+        )
+
+    except Exception:
+        logger.exception("Ошибка .decide")
+        await event.edit(
+            "❌ Ошибка DeepSeek. "
+            "Смотри logs/userbot.log"
+        )
+
+
+# ============================================================
+# .STATS
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.stats$",
+    )
+)
+async def stats_command(event):
+    if not event.is_private:
+        await event.edit(
+            "❌ .stats работает только в личке."
+        )
+        return
+
+    chat_id = event.chat_id
+
+    try:
+        await event.edit("📊 Считаю сообщения...")
+
+        # limit=0 у Telethon — это не "ноль сообщений", а способ
+        # получить только total (сервер сам считает, без скачивания
+        # переписки целиком) — быстро даже для больших историй.
+        total_result = await client.get_messages(chat_id, limit=0)
+        mine_result = await client.get_messages(
+            chat_id, limit=0, from_user="me"
+        )
+
+        total_count = total_result.total or 0
+        mine_count = mine_result.total or 0
+        his_count = max(total_count - mine_count, 0)
+
+        chat_entity = await event.get_chat()
+        peer_name = (
+            getattr(chat_entity, "first_name", None)
+            or getattr(chat_entity, "title", None)
+            or getattr(chat_entity, "username", None)
+            or "собеседник"
+        )
+
+        text = (
+            "📊 Статистика переписки:\n\n"
+            f"Ты — {mine_count}\n"
+            f"{peer_name} — {his_count}\n\n"
+            f"Всего — {total_count}"
+        )
+
+        await event.edit(text)
+
+        logger.info(
+            ".stats completed | chat=%s | mine=%s | his=%s",
+            chat_id,
+            mine_count,
+            his_count,
+        )
+
+    except Exception:
+        logger.exception("Ошибка .stats")
+        await event.edit(
+            "❌ Не удалось посчитать статистику. "
+            "Смотри logs/userbot.log"
+        )
+
+
+# ============================================================
 # .REMEMBER
 # ============================================================
 
@@ -1533,10 +1715,11 @@ async def help_command(event):
         ".mute 10m / .mute 2h — заглушить уведомления лички",
         ".unmute — снять заглушение лички",
         ".ai <запрос> — разовый вопрос к DeepSeek",
+        ".8ball <вопрос> — магический шар",
+        ".decide A или B — выбор с обоснованием",
+        ".stats — статистика переписки (только в личке)",
         ".remember — профиль + шуточный dere-тип "
         "(в личке — собеседник, в группах — ответом на сообщение)",
-        ".найти <название песни> — найти и прислать трек "
-        f"через @{MUSIC_BOT_USERNAME}",
         ".help — это сообщение",
         "",
         "Стиль в этом чате: "
@@ -1549,330 +1732,6 @@ async def help_command(event):
 
     await event.edit("\n".join(lines))
 
-
-# ============================================================
-# .НАЙТИ (поиск музыки через @smusic2bot)
-# ============================================================
-
-# Юзернейм бота-посредника для поиска музыки. Можно заменить на
-# любой другой похожий музыкальный бот через .env.
-MUSIC_BOT_USERNAME = os.getenv("MUSIC_BOT_USERNAME", "smusic2bot")
-
-# Сколько секунд ждать список результатов / ответ на каждом шаге.
-MUSIC_SEARCH_TIMEOUT = int(os.getenv("MUSIC_SEARCH_TIMEOUT", "20"))
-
-# Сколько секунд ждать сам трек после нажатия на результат
-# (обычно дольше — бот его либо качает, либо конвертирует).
-MUSIC_DOWNLOAD_TIMEOUT = int(os.getenv("MUSIC_DOWNLOAD_TIMEOUT", "40"))
-
-# Автоматически проходить рекламную "стену подписки" (вступать
-# в каналы спонсоров, жать "I have subscribed"), которую иногда
-# показывает музыкальный бот перед выдачей трека.
-MUSIC_AUTO_HANDLE_SUBSCRIBE_GATE = os.getenv(
-    "MUSIC_AUTO_HANDLE_SUBSCRIBE_GATE", "true"
-).lower() in {"1", "true", "yes"}
-
-# Защита от зацикливания, если бот присылает подряд что-то
-# неожиданное (несколько экранов подряд и т.п.).
-MUSIC_MAX_STEPS = int(os.getenv("MUSIC_MAX_STEPS", "5"))
-
-# Telegram-конвенция для "замьючено навсегда".
-MUTE_FOREVER_UNTIL = 2 ** 31 - 1
-
-INVITE_LINK_RE = re.compile(r"(?:joinchat/|\+)([\w-]+)/?$")
-
-
-async def _wait_for_bot_message(username: str, timeout: int):
-    """
-    Ждёт следующее входящее сообщение от конкретного бота.
-    Использует одноразовый обработчик + Future, снимает
-    обработчик по завершении (успех, таймаут или ошибка).
-    """
-
-    loop = asyncio.get_event_loop()
-    future = loop.create_future()
-
-    async def on_message(bot_event):
-        if not future.done():
-            future.set_result(bot_event.message)
-
-    handler = client.add_event_handler(
-        on_message,
-        events.NewMessage(incoming=True, from_users=username),
-    )
-
-    try:
-        return await asyncio.wait_for(future, timeout=timeout)
-    finally:
-        client.remove_event_handler(handler)
-
-
-async def _wait_for_bot_media(
-    username: str,
-    watched_message_id: int,
-    timeout: int,
-):
-    """
-    Ждёт ответ от бота ЛЮБЫМ из двух путей:
-    - новое входящее сообщение;
-    - редактирование уже полученного сообщения
-      (watched_message_id), если в нём появилось медиа.
-
-    Промежуточные edit'ы БЕЗ медиа (например, "Загрузка 45%...")
-    игнорируются — ждём дальше, пока не появится либо новое
-    сообщение, либо медиа в исходном, либо не истечёт таймаут.
-    """
-
-    loop = asyncio.get_event_loop()
-    future = loop.create_future()
-
-    async def on_new(bot_event):
-        if not future.done():
-            future.set_result(bot_event.message)
-
-    async def on_edit(bot_event):
-        message = bot_event.message
-        if (
-            message.id == watched_message_id
-            and message.media
-            and not future.done()
-        ):
-            future.set_result(message)
-
-    new_handler = client.add_event_handler(
-        on_new,
-        events.NewMessage(incoming=True, from_users=username),
-    )
-    edit_handler = client.add_event_handler(
-        on_edit,
-        events.MessageEdited(incoming=True, from_users=username),
-    )
-
-    try:
-        return await asyncio.wait_for(future, timeout=timeout)
-    finally:
-        client.remove_event_handler(new_handler)
-        client.remove_event_handler(edit_handler)
-
-
-def is_subscription_gate(message) -> bool:
-    """
-    Определяет экран вида "подпишись на партнёров, потом нажми
-    'I have subscribed'" по наличию соответствующей кнопки.
-    """
-
-    if not message.buttons:
-        return False
-
-    for row in message.buttons:
-        for button in row:
-            text = (button.text or "").lower()
-            if "subscribed" in text or "подписал" in text:
-                return True
-
-    return False
-
-
-async def join_channel_by_url(url: str):
-    """
-    Вступает в канал по ссылке — как публичной (t.me/name),
-    так и приватной пригласительной (t.me/+hash, t.me/joinchat/hash).
-    Возвращает entity канала (для последующего мьюта/архивации)
-    или None, если вступить не удалось.
-    """
-
-    invite_match = INVITE_LINK_RE.search(url)
-
-    try:
-        if invite_match:
-            result = await client(
-                ImportChatInviteRequest(invite_match.group(1))
-            )
-            return result.chats[0] if result.chats else None
-
-        entity = await client.get_entity(url)
-        await client(JoinChannelRequest(entity))
-        return entity
-
-    except UserAlreadyParticipantError:
-        try:
-            return await client.get_entity(url)
-        except Exception:
-            return None
-
-
-async def mute_and_archive_entity(entity):
-    """
-    Мьютит канал навсегда и переносит его в архив — чтобы
-    вынужденные подписки на спонсоров не засоряли основной
-    список чатов и не присылали уведомления.
-    """
-
-    try:
-        await client(
-            functions.account.UpdateNotifySettingsRequest(
-                peer=types.InputNotifyPeer(entity),
-                settings=types.InputPeerNotifySettings(
-                    mute_until=MUTE_FOREVER_UNTIL
-                ),
-            )
-        )
-    except Exception:
-        logger.exception(
-            ".найти: не удалось замьютить спонсорский канал"
-        )
-
-    try:
-        await client.edit_folder(entity, 1)
-    except Exception:
-        logger.exception(
-            ".найти: не удалось заархивировать спонсорский канал"
-        )
-
-
-async def resolve_subscription_gate(message):
-    """
-    Вступает во все каналы-спонсоры из кнопок сообщения, мьютит
-    и архивирует их, затем нажимает кнопку подтверждения
-    ("I have subscribed" / аналог).
-    """
-
-    join_urls = []
-    confirm_coords = None
-
-    for row_idx, row in enumerate(message.buttons):
-        for col_idx, button in enumerate(row):
-            text = (button.text or "").strip()
-            lower = text.lower()
-            url = getattr(button, "url", None)
-
-            if url:
-                join_urls.append(url)
-            elif "subscribed" in lower or "подписал" in lower:
-                confirm_coords = (row_idx, col_idx)
-
-    for url in join_urls:
-        try:
-            entity = await join_channel_by_url(url)
-            if entity is not None:
-                await mute_and_archive_entity(entity)
-        except Exception:
-            logger.exception(
-                ".найти: не удалось вступить в канал %r", url
-            )
-
-    if confirm_coords is not None:
-        try:
-            await message.click(*confirm_coords)
-        except Exception:
-            logger.exception(
-                ".найти: не удалось подтвердить подписку"
-            )
-
-
-@client.on(
-    events.NewMessage(
-        outgoing=True,
-        pattern=r"^\.найти(?:\s+([\s\S]+))?$",
-    )
-)
-async def find_music_command(event):
-    query = event.pattern_match.group(1)
-
-    if not query:
-        await event.edit(
-            "Использование: .найти название песни"
-        )
-        return
-
-    query = query.strip()
-    target_chat_id = event.chat_id
-
-    try:
-        await event.edit(f"🔎 Ищу «{query}»...")
-
-        await client.send_message(MUSIC_BOT_USERNAME, query)
-
-        message = await _wait_for_bot_message(
-            MUSIC_BOT_USERNAME,
-            MUSIC_SEARCH_TIMEOUT,
-        )
-
-        for _ in range(MUSIC_MAX_STEPS):
-            if message.media:
-                break
-
-            if is_subscription_gate(message):
-                if not MUSIC_AUTO_HANDLE_SUBSCRIBE_GATE:
-                    break
-
-                await event.edit(
-                    "📢 Бот просит подписку на спонсоров — "
-                    "подписываюсь, мьючу и архивирую их..."
-                )
-
-                await resolve_subscription_gate(message)
-
-                message = await _wait_for_bot_media(
-                    MUSIC_BOT_USERNAME,
-                    message.id,
-                    MUSIC_SEARCH_TIMEOUT,
-                )
-                continue
-
-            if message.buttons:
-                await event.edit(
-                    "🔎 Нашёл варианты, скачиваю первый..."
-                )
-
-                await message.click(0, 0)
-
-                message = await _wait_for_bot_media(
-                    MUSIC_BOT_USERNAME,
-                    message.id,
-                    MUSIC_DOWNLOAD_TIMEOUT,
-                )
-                continue
-
-            break
-
-        result_message = message
-
-        if result_message.media:
-            await client.send_file(
-                target_chat_id,
-                result_message.media,
-                caption=result_message.text or f"🎵 {query}",
-            )
-            try:
-                await event.delete()
-            except Exception:
-                await event.edit("✅ Готово.")
-        elif result_message.text:
-            await event.edit(
-                "ℹ️ Ответ бота:\n\n" + result_message.text
-            )
-        else:
-            await event.edit(
-                "❌ Не удалось получить трек — пустой ответ."
-            )
-
-        logger.info(
-            ".найти completed | chat=%s | query=%r",
-            target_chat_id,
-            query,
-        )
-
-    except asyncio.TimeoutError:
-        await event.edit(
-            f"❌ @{MUSIC_BOT_USERNAME} не ответил вовремя."
-        )
-
-    except Exception:
-        logger.exception("Ошибка .найти | query=%r", query)
-        await event.edit(
-            "❌ Ошибка поиска музыки. Смотри logs/userbot.log"
-        )
 
 
 # ============================================================
@@ -2402,7 +2261,9 @@ async def main():
     print(".unmute")
     print(".remember")
     print(".ai запрос")
-    print(f".найти <название песни> (через @{MUSIC_BOT_USERNAME})")
+    print(".8ball вопрос")
+    print(".decide A или B")
+    print(".stats")
     print(".help")
     print()
     print(

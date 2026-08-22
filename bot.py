@@ -1437,17 +1437,24 @@ async def stats_command(event):
     try:
         await event.edit("📊 Считаю сообщения...")
 
-        # limit=0 у Telethon — это не "ноль сообщений", а способ
-        # получить только total (сервер сам считает, без скачивания
-        # переписки целиком) — быстро даже для больших историй.
-        total_result = await client.get_messages(chat_id, limit=0)
-        mine_result = await client.get_messages(
-            chat_id, limit=0, from_user="me"
-        )
+        # get_messages(limit=0, from_user=...) в Telethon иногда
+        # игнорирует фильтр по отправителю (известная особенность
+        # "быстрого" total-запроса) — поэтому считаем честно,
+        # перебирая историю и проверяя message.out на каждом
+        # сообщении, как это уже делает .remember.
+        mine_count = 0
+        his_count = 0
 
-        total_count = total_result.total or 0
-        mine_count = mine_result.total or 0
-        his_count = max(total_count - mine_count, 0)
+        async for message in client.iter_messages(
+            chat_id,
+            limit=REMEMBER_MAX_MESSAGES,
+        ):
+            if message.out:
+                mine_count += 1
+            else:
+                his_count += 1
+
+        total_count = mine_count + his_count
 
         chat_entity = await event.get_chat()
         peer_name = (
@@ -1463,6 +1470,12 @@ async def stats_command(event):
             f"{peer_name} — {his_count}\n\n"
             f"Всего — {total_count}"
         )
+
+        if total_count >= REMEMBER_MAX_MESSAGES:
+            text += (
+                f"\n\n(учтены последние {REMEMBER_MAX_MESSAGES} "
+                "сообщений — история длиннее лимита REMEMBER_MAX_MESSAGES)"
+            )
 
         await event.edit(text)
 

@@ -848,6 +848,19 @@ def split_for_telegram(
     return parts
 
 
+def format_qa(question: str, answer: str) -> str:
+    """
+    Склеивает вопрос и ответ в одну реплику вида
+    "вопрос? ответ" — убирает у вопроса свои знаки препинания
+    на конце, чтобы не задваивалось ("я гей??").
+    """
+
+    q = question.strip().rstrip("?!.").strip()
+    a = answer.strip()
+
+    return f"{q}? {a}" if q else a
+
+
 def parse_duration(value: str) -> int:
     match = re.fullmatch(
         r"(\d+(?:\.\d+)?)(s|m|h|d)",
@@ -1260,7 +1273,8 @@ async def ai_command(event):
         await event.edit("🤖 Думаю...")
 
         answer = await ask_ai(prompt)
-        parts = split_for_telegram(answer)
+        full_text = format_qa(prompt, answer)
+        parts = split_for_telegram(full_text)
 
         await event.edit(parts[0])
 
@@ -1318,7 +1332,7 @@ async def eightball_command(event):
 
         answer = await ask_ai(prompt)
 
-        await event.edit(f"🎱 {answer}")
+        await event.edit("🎱 " + format_qa(question, answer))
 
         logger.info(
             ".8ball completed | chat=%s | question=%r",
@@ -1382,7 +1396,9 @@ async def decide_command(event):
 
         answer = await ask_ai(prompt)
 
-        await event.edit(f"🎲 {answer}")
+        await event.edit(
+            "🎲 " + format_qa(f"{option_a} или {option_b}", answer)
+        )
 
         logger.info(
             ".decide completed | chat=%s | a=%r | b=%r",

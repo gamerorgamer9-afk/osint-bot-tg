@@ -218,6 +218,19 @@ processed_messages_order: deque[int] = deque(
     maxlen=PROCESSED_MESSAGES_MAX
 )
 
+# --- Автоответчик (.auto) ------------------------------------
+# Глобальный тумблер переключается ТОЛЬКО из Избранного
+# (Saved Messages). В любом другом чате .auto лишь добавляет
+# этот чат в исключения — включить обратно там же нельзя,
+# только заново через Избранное можно отключить/включить
+# автоответчик целиком (исключения при этом не сбрасываются).
+autoresponder_enabled: bool = False
+autoresponder_excluded_chats: set[int] = set()
+
+# ID владельца аккаунта — заполняется в main() после client.start(),
+# нужен, чтобы отличить Избранное от обычной личной переписки.
+OWNER_ID: int | None = None
+
 
 def mark_processed(message_id: int) -> bool:
     """Возвращает False, если сообщение уже было обработано."""
@@ -1610,6 +1623,87 @@ async def stats_command(event):
 
 
 # ============================================================
+# .AUTO (автоответчик на слово "фен")
+# ============================================================
+
+AUTORESPONDER_TRIGGER_RE = re.compile(r"\bфен\b", re.IGNORECASE)
+AUTORESPONDER_REPLY_TEXT = "да?"
+
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.auto$",
+    )
+)
+async def auto_command(event):
+    global autoresponder_enabled
+
+    chat_id = event.chat_id
+
+    if chat_id == OWNER_ID:
+        # Избранное — главный тумблер, переключает автоответчик
+        # целиком во всех чатах (кроме тех, что были исключены
+        # отдельно — исключения при переключении не сбрасываются).
+        autoresponder_enabled = not autoresponder_enabled
+
+        status = "включён" if autoresponder_enabled else "выключен"
+        await event.edit(f"🤖 Автоответчик глобально {status}.")
+
+        logger.info(
+            "Autoresponder global toggle | enabled=%s",
+            autoresponder_enabled,
+        )
+        return
+
+    # Любой другой чат — .auto здесь только ВЫКЛЮЧАЕТ
+    # автоответчик именно в этом чате. Включить обратно можно
+    # только глобальным тумблером из Избранного.
+    autoresponder_excluded_chats.add(chat_id)
+
+    await event.edit(
+        "🤖 Автоответчик отключён в этом чате "
+        "(включить обратно можно только из Избранного)."
+    )
+
+    logger.info(
+        "Autoresponder excluded chat | chat=%s",
+        chat_id,
+    )
+
+
+@client.on(events.NewMessage(incoming=True))
+async def autoresponder_handler(event):
+    if not autoresponder_enabled:
+        return
+
+    chat_id = event.chat_id
+
+    if chat_id is None or chat_id in autoresponder_excluded_chats:
+        return
+
+    text = event.raw_text or ""
+
+    if not AUTORESPONDER_TRIGGER_RE.search(text):
+        return
+
+    try:
+        await event.reply(AUTORESPONDER_REPLY_TEXT)
+
+        logger.info(
+            "Autoresponder triggered | chat=%s | message=%s",
+            chat_id,
+            event.id,
+        )
+
+    except Exception:
+        logger.exception(
+            "Autoresponder: не удалось ответить | chat=%s",
+            chat_id,
+        )
+
+
+# ============================================================
 # .REMEMBER
 # ============================================================
 
@@ -1863,6 +1957,8 @@ async def help_command(event):
         ".decide A или B — выбор с обоснованием",
         ".math 5 + 3 — калькулятор (+ - * / % : x, скобки)",
         ".stats — статистика переписки (только в личке)",
+        ".auto — автоответчик на слово «фен» (тумблер — "
+        "только в Избранном; в др. чатах — только выключает)",
         ".remember — профиль + шуточный dere-тип "
         "(в личке — собеседник, в группах — ответом на сообщение)",
         ".help — это сообщение",
@@ -2379,6 +2475,9 @@ async def main():
 
     me = await client.get_me()
 
+    global OWNER_ID
+    OWNER_ID = me.id
+
     logger.info(
         "Авторизован: id=%s username=%s",
         me.id,
@@ -2400,7 +2499,7 @@ async def main():
     print("Команды:")
     print(".catgirl")
     print(".tsundere")
-    print(".clone (в группах — ответом на сообщение цели)")
+    print(".clone")
     print(".reset")
     print(".mute 10m")
     print(".unmute")
@@ -2410,6 +2509,7 @@ async def main():
     print(".decide A или B")
     print(".math 5 + 3")
     print(".stats")
+    print(".auto (тумблер только из Избранного)")
     print(".help")
     print()
     print(

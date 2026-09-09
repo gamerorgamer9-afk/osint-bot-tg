@@ -1,5 +1,6 @@
 import asyncio
 import ast
+import io
 import logging
 import operator
 import os
@@ -9,6 +10,7 @@ import time
 from collections import deque, OrderedDict
 from pathlib import Path
 
+import aiohttp
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from telethon import TelegramClient, events, functions, types
@@ -19,6 +21,36 @@ try:
     from aiohttp import web as aiohttp_web
 except ImportError:
     aiohttp_web = None
+
+# Дополнительные (опциональные) зависимости под .ocr/.vm — требуют
+# ещё и системных бинарников (Tesseract OCR, ffmpeg), поэтому
+# оборачиваем в try/except: если не установлены, бот всё равно
+# стартует, просто эти конкретные команды сообщат, чего не хватает.
+try:
+    import cv2
+    import numpy as np
+except ImportError:
+    cv2 = None
+    np = None
+
+try:
+    import pytesseract
+
+    _TESSERACT_CMD = os.getenv("TESSERACT_CMD")
+    if _TESSERACT_CMD:
+        pytesseract.pytesseract.tesseract_cmd = _TESSERACT_CMD
+except ImportError:
+    pytesseract = None
+
+try:
+    from pydub import AudioSegment
+except ImportError:
+    AudioSegment = None
+
+try:
+    import speech_recognition as sr
+except ImportError:
+    sr = None
 
 
 # ============================================================
@@ -92,7 +124,39 @@ CLONE_MAX_CHARS = int(os.getenv("CLONE_MAX_CHARS", "6000"))
 # шуточной dere-классификации в конце .remember.
 DERE_MAX_CHARS = int(os.getenv("DERE_MAX_CHARS", "6000"))
 
+# --- Настройки токен-экономии .remember ------------------------
+# Раньше .remember резал историю на куски по 12000 симв. и делал
+# до 30 отдельных запросов на анализ + ещё 2 финальных (профиль,
+# dere) — до 32 запросов на одну команду, и каждый заново тащит
+# системную инструкцию. Теперь куски крупнее (меньше повторов
+# инструкции на тот же объём текста), а профиль и dere-тип
+# считаются ОДНИМ финальным запросом вместо двух. Суммарный
+# потолок анализируемого текста тот же (кусков * размер куска),
+# просто достигается за куда меньшее число обращений к API.
+REMEMBER_CHUNK_CHARS = int(os.getenv("REMEMBER_CHUNK_CHARS", "45000"))
+REMEMBER_MAX_CHUNKS = int(os.getenv("REMEMBER_MAX_CHUNKS", "8"))
+
 TELEGRAM_MESSAGE_LIMIT = 4096
+
+# --- .f (анимированный текст) ---------------------------------
+# Задержка между шагами появления текста и максимум слов —
+# защита от лишних edit'ов на очень длинный текст (FloodWait).
+ANIMATED_TEXT_DELAY = float(os.getenv("ANIMATED_TEXT_DELAY", "0.4"))
+ANIMATED_TEXT_MAX_WORDS = int(os.getenv("ANIMATED_TEXT_MAX_WORDS", "60"))
+
+# --- .geo / .geolive (геокодинг через OpenStreetMap Nominatim) -
+# Nominatim требует свой User-Agent и не более ~1 запроса/сек —
+# для личного использования этого более чем достаточно.
+NOMINATIM_USER_AGENT = os.getenv(
+    "NOMINATIM_USER_AGENT", "TelegramUserbot/1.0 (personal use)"
+)
+GEOLIVE_PERIOD_SECONDS = int(os.getenv("GEOLIVE_PERIOD_SECONDS", "900"))
+
+# --- .ocr (текст + QR/штрихкоды с фото) ------------------------
+OCR_LANGUAGES = os.getenv("OCR_LANGUAGES", "rus+eng")
+
+# --- .vm (расшифровка голосовых/кружков) ------------------------
+VOICE_TRANSCRIBE_LANG = os.getenv("VOICE_TRANSCRIBE_LANG", "ru-RU")
 
 # --- Health-check веб-сервер (для бесплатного Web Service на
 # Render и подобных платформах, которым нужен открытый HTTP-порт,
@@ -275,6 +339,11 @@ channel_message_cache: "OrderedDict[tuple[int, int], dict]" = (
 )
 chat_label_cache: "OrderedDict[int, str]" = OrderedDict()
 
+# Чаты, где трекер удалённых сообщений выключен командой .save.
+# В отличие от .auto — переключается прямо в том же чате, без
+# отдельного "главного" чата-пульта.
+delete_tracker_excluded_chats: set[int] = set()
+
 
 def _bounded_put(cache: OrderedDict, key, value, maxlen: int):
     """
@@ -299,6 +368,39 @@ def _bounded_put(cache: OrderedDict, key, value, maxlen: int):
                 os.remove(media_path)
             except OSError:
                 pass
+
+
+def _purge_chat_from_delete_cache(chat_id: int):
+    """
+    Удаляет из кэша трекера все уже сохранённые сообщения этого
+    чата — вызывается при отключении через .save, чтобы старые
+    закэшированные сообщения не всплыли в отчётах, если их удалят
+    уже ПОСЛЕ отключения.
+    """
+
+    for key in list(pm_message_cache.keys()):
+        entry = pm_message_cache[key]
+
+        if entry.get("chat_id") == chat_id:
+            evicted = pm_message_cache.pop(key)
+            media_path = evicted.get("media_path")
+
+            if media_path:
+                try:
+                    os.remove(media_path)
+                except OSError:
+                    pass
+
+    for key in list(channel_message_cache.keys()):
+        if key[0] == chat_id:
+            evicted = channel_message_cache.pop(key)
+            media_path = evicted.get("media_path")
+
+            if media_path:
+                try:
+                    os.remove(media_path)
+                except OSError:
+                    pass
 
 
 # ============================================================
@@ -577,40 +679,104 @@ def build_clone_system_prompt(style_description: str) -> str:
 # DERE-КЛАССИФИКАЦИЯ (для .remember)
 # ============================================================
 
-DERE_CLASSIFICATION_PROMPT_TEMPLATE = r"""
-Это шуточная развлекательная классификация в стиле аниме-тропов,
-НЕ психологический диагноз и не серьёзный анализ личности.
+# --- .REMEMBER: экономные промпты (профиль + dere одним запросом) --
 
-На основе манеры общения человека в сообщениях ниже определи,
-какой аниме-архетип «dere» ему больше всего подходит по СТИЛЮ
-ОБЩЕНИЯ (тон, эмоциональность, теплота/холодность речи), например:
+# Общие правила для раздела DERE — вынесены отдельно, чтобы не
+# дублировать текст в двух шаблонах ниже.
+_DERE_SECTION_RULES = r"""
+===DERE===
+Тип: <архетип — цундере, яндере, кудере, дандере, дередере,
+химедере, бокукко/твёрдый, или другой похожий, если точнее>
+Почему: <1-2 предложения, основанные ТОЛЬКО на манере речи>
 
-- цундере — на словах резкий/холодный, по факту заботливый;
-- яндере — в переписке видна эмоциональная интенсивность,
-  собственнический тон в шутку или всерьёз (оценивай ТОЛЬКО
-  манеру речи, не делай реальных выводов о психике человека);
-- кудере — внешне холодный, немногословный, сдержанный;
-- дандере — тихий, стеснительный, раскрывается постепенно;
-- дередере — открыто ласковый, дружелюбный, тёплый сразу;
-- химедере — держится как "принцесса", любит внимание к себе;
-- бокукко/твёрдый — прямолинейный, грубоватый, без сантиментов.
+Это шуточная развлекательная категоризация в стиле аниме-тропов
+(вроде гороскопа), НЕ психологический диагноз. Оценивай только
+тон/эмоциональность/теплоту речи, не делай реальных выводов
+о характере или психике человека.
+"""
 
-Можешь выбрать другой похожий архетип, если он точнее подходит.
-Выбери ОДИН наиболее подходящий вариант.
+# Быстрый путь: вся история умещается в один кусок текста —
+# факты, профиль и dere-тип извлекаются ОДНИМ запросом, без
+# отдельного шага "сначала факты, потом профиль".
+REMEMBER_SINGLE_PASS_PROMPT_TEMPLATE = (
+    r"""
+Проанализируй сообщения одного человека из личной переписки и
+сделай два раздела ниже. Не добавляй ничего от себя, не делай
+выводов о чувствительных характеристиках (возраст, национальность,
+религия, здоровье, сексуальная ориентация, политические взгляды
+и т.п.) — если факт не был явно сообщён, не придумывай его.
 
-Не делай реальных психологических выводов, не ставь диагнозов,
-не анализируй истинный характер или мотивацию человека — это
-исключительно развлекательная категоризация по манере переписки,
-подобная гороскопу.
+Ответ дай СТРОГО в этом формате, с двумя разделами:
 
-Ответ дай СТРОГО в формате:
+===ПРОФИЛЬ===
+Из переписки понятно, что человек:
+— ...
+— ...
+— ...
 
-Тип: <название архетипа>
-Почему: <1-2 предложения, основанные только на стиле общения>
-
-Сообщения для анализа:
+Общий стиль общения: ...
+"""
+    + _DERE_SECTION_RULES
+    + r"""
+---
+Сообщения:
 {combined_text}
 """
+)
+
+# Финальный шаг многошагового пути: на входе уже извлечённые из
+# кусков факты (для раздела ПРОФИЛЬ) + сырой образец сообщений
+# (нужен для DERE — там важна манера речи, а не факты).
+REMEMBER_COMBINE_PROMPT_TEMPLATE = (
+    r"""
+Сделай два раздела ниже на основе данных под ними. Не добавляй
+ничего от себя, не делай выводов о чувствительных характеристиках.
+Если факт неизвестен — не придумывай.
+
+Ответ дай СТРОГО в этом формате, с двумя разделами:
+
+===ПРОФИЛЬ===
+Из переписки понятно, что человек (на основе списка фактов ниже):
+— ...
+— ...
+— ...
+
+Общий стиль общения: ...
+"""
+    + _DERE_SECTION_RULES
+    + r"""
+---
+Извлечённые факты:
+{extracted_facts}
+
+Образец сообщений (только для определения манеры речи в разделе
+DERE, содержание не пересказывать в ПРОФИЛЬ):
+{dere_sample}
+"""
+)
+
+
+def split_profile_and_dere(text: str):
+    """
+    Разбирает ответ модели на секции ===ПРОФИЛЬ=== / ===DERE===.
+    Если разметка почему-то не пришла — считает весь ответ
+    профилем, а dere просто не показываем (не роняем .remember
+    из-за этого).
+    """
+
+    dere_marker = "===DERE==="
+
+    if dere_marker in text:
+        profile_part, _, dere_part = text.partition(dere_marker)
+    else:
+        profile_part, dere_part = text, None
+
+    profile_part = profile_part.replace("===ПРОФИЛЬ===", "").strip()
+
+    if dere_part:
+        dere_part = dere_part.strip()
+
+    return profile_part, dere_part
 
 
 # ============================================================
@@ -635,6 +801,22 @@ PROFANITY_REPLACEMENTS = {
     "долбоёб": "дурак",
 }
 
+# Регексы компилируются один раз при старте, а не на каждый вызов
+# sanitize_for_ai (а это каждое сообщение в .catgirl/.tsundere/
+# .clone) — компиляция одного и того же паттерна заново на каждое
+# сообщение была лишней тратой CPU без всякой пользы.
+_PROFANITY_PATTERNS = [
+    (
+        re.compile(rf"(?<!\w){re.escape(bad_word)}(?!\w)", re.IGNORECASE),
+        safe_word,
+    )
+    for bad_word, safe_word in sorted(
+        PROFANITY_REPLACEMENTS.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+]
+
 
 def preserve_case(original: str, replacement: str) -> str:
     if original.isupper():
@@ -647,17 +829,9 @@ def preserve_case(original: str, replacement: str) -> str:
 def sanitize_for_ai(text: str) -> str:
     result = text
 
-    for bad_word, safe_word in sorted(
-        PROFANITY_REPLACEMENTS.items(),
-        key=lambda item: len(item[0]),
-        reverse=True,
-    ):
-        pattern = re.compile(
-            rf"(?<!\w){re.escape(bad_word)}(?!\w)",
-            re.IGNORECASE,
-        )
+    for pattern, safe_word in _PROFANITY_PATTERNS:
         result = pattern.sub(
-            lambda match: preserve_case(
+            lambda match, safe_word=safe_word: preserve_case(
                 match.group(0),
                 safe_word,
             ),
@@ -1704,6 +1878,591 @@ async def autoresponder_handler(event):
 
 
 # ============================================================
+# .SAVE (вкл/выкл трекер удалённых сообщений в конкретном чате)
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.save$",
+    )
+)
+async def save_toggle_command(event):
+    chat_id = event.chat_id
+
+    if chat_id in delete_tracker_excluded_chats:
+        delete_tracker_excluded_chats.discard(chat_id)
+
+        await event.edit(
+            "💾 Сохранение удалённых сообщений в этом чате "
+            "включено."
+        )
+
+        logger.info(
+            "Delete-tracker re-enabled for chat | chat=%s",
+            chat_id,
+        )
+
+    else:
+        delete_tracker_excluded_chats.add(chat_id)
+
+        # Подчищаем уже закэшированные сообщения этого чата, чтобы
+        # они точно не всплыли в отчётах, если их удалят уже после
+        # отключения.
+        _purge_chat_from_delete_cache(chat_id)
+
+        await event.edit(
+            "💾 Сохранение удалённых сообщений в этом чате "
+            "выключено."
+        )
+
+        logger.info(
+            "Delete-tracker disabled for chat | chat=%s",
+            chat_id,
+        )
+
+
+# ============================================================
+# .F (анимированный текст)
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.f(?:\s+([\s\S]+))?$",
+    )
+)
+async def animated_text_command(event):
+    text = event.pattern_match.group(1)
+
+    if not text:
+        await event.edit("Использование: .f текст")
+        return
+
+    words = text.strip().split(" ")
+
+    if len(words) > ANIMATED_TEXT_MAX_WORDS:
+        words = words[:ANIMATED_TEXT_MAX_WORDS]
+
+    current = ""
+
+    for index, word in enumerate(words):
+        current = f"{current} {word}".strip() if current else word
+
+        try:
+            await event.edit(current)
+        except Exception:
+            logger.exception(".f: не удалось отредактировать шаг анимации")
+            return
+
+        if index < len(words) - 1:
+            await asyncio.sleep(ANIMATED_TEXT_DELAY)
+
+
+# ============================================================
+# .GEO / .GEOLIVE (геолокация через OpenStreetMap Nominatim)
+# ============================================================
+
+async def geocode_place(query: str):
+    """
+    Ищет место по названию через Nominatim (OpenStreetMap).
+    Возвращает (lat, lon, display_name) или None, если не нашлось.
+    """
+
+    headers = {"User-Agent": NOMINATIM_USER_AGENT}
+    params = {"q": query, "format": "json", "limit": 1}
+
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.get(
+            "https://nominatim.openstreetmap.org/search",
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as response:
+            data = await response.json()
+
+    if not data:
+        return None
+
+    item = data[0]
+    return float(item["lat"]), float(item["lon"]), item.get(
+        "display_name", query
+    )
+
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.geo(?:\s+([\s\S]+))?$",
+    )
+)
+async def geo_command(event):
+    place = event.pattern_match.group(1)
+
+    if not place:
+        await event.edit("Использование: .geo место")
+        return
+
+    try:
+        await event.edit(f"📍 Ищу «{place}»...")
+
+        result = await geocode_place(place)
+
+        if result is None:
+            await event.edit(f"❌ Не удалось найти «{place}».")
+            return
+
+        lat, lon, _display_name = result
+
+        await client(
+            functions.messages.SendMediaRequest(
+                peer=await event.get_input_chat(),
+                media=types.InputMediaGeoPoint(
+                    geo_point=types.InputGeoPoint(lat=lat, long=lon)
+                ),
+                message="",
+                random_id=random.getrandbits(63),
+            )
+        )
+
+        await event.delete()
+
+        logger.info(
+            ".geo completed | chat=%s | place=%r",
+            event.chat_id,
+            place,
+        )
+
+    except Exception:
+        logger.exception(".geo error | place=%r", place)
+        await event.edit("❌ Не удалось отправить геолокацию.")
+
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.geolive(?:\s+([\s\S]+))?$",
+    )
+)
+async def geolive_command(event):
+    place = event.pattern_match.group(1)
+
+    if not place:
+        await event.edit("Использование: .geolive место")
+        return
+
+    try:
+        await event.edit(f"📍 Ищу «{place}»...")
+
+        result = await geocode_place(place)
+
+        if result is None:
+            await event.edit(f"❌ Не удалось найти «{place}».")
+            return
+
+        lat, lon, _display_name = result
+
+        await client(
+            functions.messages.SendMediaRequest(
+                peer=await event.get_input_chat(),
+                media=types.InputMediaGeoLive(
+                    geo_point=types.InputGeoPoint(lat=lat, long=lon),
+                    period=GEOLIVE_PERIOD_SECONDS,
+                ),
+                message="",
+                random_id=random.getrandbits(63),
+            )
+        )
+
+        await event.delete()
+
+        logger.info(
+            ".geolive completed | chat=%s | place=%r",
+            event.chat_id,
+            place,
+        )
+
+    except Exception:
+        logger.exception(".geolive error | place=%r", place)
+        await event.edit(
+            "❌ Не удалось запустить трансляцию геолокации."
+        )
+
+
+# ============================================================
+# .OCR (текст + QR/штрихкоды с фото)
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.ocr$",
+    )
+)
+async def ocr_command(event):
+    if cv2 is None or np is None:
+        await event.edit(
+            "❌ Не установлен пакет opencv-python. "
+            "Смотри инструкцию по установке."
+        )
+        return
+
+    if pytesseract is None:
+        await event.edit(
+            "❌ Не установлен пакет pytesseract (плюс сам движок "
+            "Tesseract OCR). Смотри инструкцию по установке."
+        )
+        return
+
+    if not event.is_reply:
+        await event.edit("Ответь этой командой на фото.")
+        return
+
+    reply = await event.get_reply_message()
+
+    if not reply or not reply.photo:
+        await event.edit(
+            "❌ В сообщении, на которое ты ответил, нет фото."
+        )
+        return
+
+    try:
+        await event.edit("🧪 Распознаю...")
+
+        image_bytes = await reply.download_media(file=bytes)
+
+        if not image_bytes:
+            await event.edit("❌ Не удалось скачать фото.")
+            return
+
+        np_arr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+        if img is None:
+            await event.edit("❌ Не удалось декодировать изображение.")
+            return
+
+        qr_detector = cv2.QRCodeDetector()
+        qr_text, _points, _straight = qr_detector.detectAndDecode(img)
+
+        try:
+            ocr_text = pytesseract.image_to_string(
+                img, lang=OCR_LANGUAGES
+            ).strip()
+        except Exception:
+            # Возможно, не установлен языковой пакет (например rus) —
+            # пробуем откатиться на английский, чтобы не падать совсем.
+            logger.exception(
+                ".ocr: ошибка с lang=%s, пробую 'eng'", OCR_LANGUAGES
+            )
+            ocr_text = pytesseract.image_to_string(img, lang="eng").strip()
+
+        lines = ["🧪 OCR результат:"]
+
+        if qr_text:
+            lines.append(f"\n📷 QR/код: {qr_text}")
+
+        if ocr_text:
+            lines.append(f"\n📝 Текст:\n{ocr_text}")
+
+        if not qr_text and not ocr_text:
+            lines.append("\nНичего не найдено.")
+
+        parts = split_for_telegram("\n".join(lines))
+
+        await event.edit(parts[0])
+
+        for part in parts[1:]:
+            await event.reply(part)
+
+        logger.info(".ocr completed | chat=%s", event.chat_id)
+
+    except Exception:
+        logger.exception(".ocr error")
+        await event.edit(
+            "❌ Ошибка распознавания. Смотри logs/userbot.log"
+        )
+
+
+# ============================================================
+# .VM (расшифровка голосовых сообщений и кружков)
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.vm$",
+    )
+)
+async def voice_transcribe_command(event):
+    if AudioSegment is None:
+        await event.edit(
+            "❌ Не установлен пакет pydub (плюс ffmpeg). "
+            "Смотри инструкцию по установке."
+        )
+        return
+
+    if sr is None:
+        await event.edit(
+            "❌ Не установлен пакет SpeechRecognition. "
+            "Смотри инструкцию по установке."
+        )
+        return
+
+    if not event.is_reply:
+        await event.edit("Ответь этой командой на голосовое или кружок.")
+        return
+
+    reply = await event.get_reply_message()
+
+    if not reply or not (reply.voice or reply.video_note):
+        await event.edit(
+            "❌ В сообщении, на которое ты ответил, нет "
+            "голосового/кружка."
+        )
+        return
+
+    try:
+        await event.edit("🎙 Распознаю речь...")
+
+        media_bytes = await reply.download_media(file=bytes)
+
+        if not media_bytes:
+            await event.edit("❌ Не удалось скачать аудио.")
+            return
+
+        audio = AudioSegment.from_file(io.BytesIO(media_bytes))
+
+        wav_io = io.BytesIO()
+        audio.export(wav_io, format="wav")
+        wav_io.seek(0)
+
+        recognizer = sr.Recognizer()
+
+        with sr.AudioFile(wav_io) as source:
+            audio_data = recognizer.record(source)
+
+        text = recognizer.recognize_google(
+            audio_data, language=VOICE_TRANSCRIBE_LANG
+        )
+
+        await event.edit(f"🎙 Расшифровка:\n\n{text}")
+
+        logger.info(".vm completed | chat=%s", event.chat_id)
+
+    except sr.UnknownValueError:
+        await event.edit("❌ Не удалось разобрать речь.")
+
+    except Exception:
+        logger.exception(".vm error")
+        await event.edit(
+            "❌ Ошибка распознавания. Смотри logs/userbot.log"
+        )
+
+
+# ============================================================
+# .PAID (отправка фото за звёзды — экспериментально)
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.paid(?:\s+(\d+))?$",
+    )
+)
+async def paid_media_command(event):
+    stars_raw = event.pattern_match.group(1)
+
+    if not event.is_reply or not stars_raw:
+        await event.edit(
+            "Использование: ответь командой .paid <звёзды> на фото\n"
+            "Пример: .paid 50"
+        )
+        return
+
+    stars_amount = int(stars_raw)
+
+    reply = await event.get_reply_message()
+
+    if not reply or not reply.photo:
+        await event.edit(
+            "❌ В сообщении, на которое ты ответил, нет фото."
+        )
+        return
+
+    try:
+        await event.edit(
+            f"⭐ Готовлю платное фото за {stars_amount} звёзд..."
+        )
+
+        photo_bytes = await reply.download_media(file=bytes)
+
+        if not photo_bytes:
+            await event.edit("❌ Не удалось скачать фото.")
+            return
+
+        uploaded = await client.upload_file(
+            photo_bytes, file_name="photo.jpg"
+        )
+
+        paid_media = types.InputMediaPaidMedia(
+            stars_amount=stars_amount,
+            extended_media=[
+                types.InputMediaUploadedPhoto(file=uploaded)
+            ],
+        )
+
+        await client(
+            functions.messages.SendMediaRequest(
+                peer=await event.get_input_chat(),
+                media=paid_media,
+                message="",
+                random_id=random.getrandbits(63),
+            )
+        )
+
+        await event.delete()
+
+        logger.info(
+            ".paid completed | chat=%s | stars=%s",
+            event.chat_id,
+            stars_amount,
+        )
+
+    except Exception:
+        logger.exception(".paid error")
+        await event.edit(
+            "❌ Не удалось отправить платное медиа. Эта функция "
+            "экспериментальная — возможно, не поддерживается в "
+            "этом типе чата, или нужна более новая версия Telethon "
+            "(pip install -U telethon). Смотри logs/userbot.log"
+        )
+
+
+# ============================================================
+# .SAVEONCE (сохранить одноразовое фото, если оно ещё доступно)
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.saveonce$",
+    )
+)
+async def save_once_command(event):
+    if not event.is_reply:
+        await event.edit(
+            "Ответь этой командой на одноразовое фото собеседника."
+        )
+        return
+
+    reply = await event.get_reply_message()
+
+    if not reply or not reply.media:
+        await event.edit(
+            "❌ В сообщении, на которое ты ответил, нет медиа "
+            "(либо Telegram уже не даёт к нему доступ — "
+            "одноразовые фото становятся недоступны сразу после "
+            "просмотра)."
+        )
+        return
+
+    try:
+        media_bytes = await reply.download_media(file=bytes)
+
+        if not media_bytes:
+            await event.edit(
+                "❌ Telegram не дал скачать это медиа — скорее "
+                "всего, оно уже недоступно (одноразовое и уже "
+                "просмотрено)."
+            )
+            return
+
+        await client.send_file(
+            "me",
+            media_bytes,
+            caption="💾 Сохранено через .saveonce",
+        )
+
+        await event.edit("💾 Сохранено в Избранное.")
+
+        logger.info(".saveonce completed | chat=%s", event.chat_id)
+
+    except Exception:
+        logger.exception(".saveonce error")
+        await event.edit(
+            "❌ Не удалось сохранить — вероятно, Telegram уже "
+            "закрыл доступ к этому медиа."
+        )
+
+
+# ============================================================
+# .INFO (информация о собеседнике)
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        outgoing=True,
+        pattern=r"^\.info$",
+    )
+)
+async def info_command(event):
+    if not event.is_private:
+        await event.edit("❌ .info работает только в личке.")
+        return
+
+    try:
+        entity = await event.get_chat()
+
+        lines = ["ℹ️ Информация о собеседнике:", ""]
+        lines.append(f"ID: {entity.id}")
+
+        username = getattr(entity, "username", None)
+        if username:
+            lines.append(f"Username: @{username}")
+
+        name = " ".join(
+            part
+            for part in [
+                getattr(entity, "first_name", None),
+                getattr(entity, "last_name", None),
+            ]
+            if part
+        )
+        if name:
+            lines.append(f"Имя: {name}")
+
+        if getattr(entity, "premium", False):
+            lines.append("Premium: да")
+
+        if getattr(entity, "bot", False):
+            lines.append("Это бот: да")
+
+        if getattr(entity, "verified", False):
+            lines.append("Verified: да")
+
+        if getattr(entity, "scam", False):
+            lines.append("⚠️ Помечен как scam")
+
+        if getattr(entity, "fake", False):
+            lines.append("⚠️ Помечен как fake")
+
+        phone = getattr(entity, "phone", None)
+        if phone:
+            lines.append(f"Телефон: {phone}")
+
+        await event.edit("\n".join(lines))
+
+        logger.info(".info completed | chat=%s", event.chat_id)
+
+    except Exception:
+        logger.exception(".info error")
+        await event.edit(
+            "❌ Не удалось получить информацию. "
+            "Смотри logs/userbot.log"
+        )
+
+
+# ============================================================
 # .REMEMBER
 # ============================================================
 
@@ -1795,7 +2554,10 @@ async def remember_command(event):
         for text in messages:
             text = text[:2000]
 
-            if chunk and chunk_length + len(text) > 12000:
+            if (
+                chunk
+                and chunk_length + len(text) > REMEMBER_CHUNK_CHARS
+            ):
                 chunks.append("\n".join(chunk))
                 chunk = []
                 chunk_length = 0
@@ -1806,104 +2568,75 @@ async def remember_command(event):
         if chunk:
             chunks.append("\n".join(chunk))
 
-        extracted = []
+        chunks = chunks[:REMEMBER_MAX_CHUNKS]
 
-        for index, chunk_text in enumerate(chunks[:30], start=1):
-            prompt = f"""
-Ты анализируешь фрагмент личной переписки.
+        if len(chunks) == 1:
+            # Быстрый путь: вся история умещается в один кусок —
+            # факты + профиль + dere одним запросом к DeepSeek,
+            # без промежуточного шага извлечения фактов.
+            combined = await ask_ai(
+                REMEMBER_SINGLE_PASS_PROMPT_TEMPLATE.format(
+                    combined_text=chunks[0]
+                )
+            )
+        else:
+            # Длинная история: сначала извлекаем факты из каждого
+            # куска (кусков теперь заметно меньше, чем раньше —
+            # см. REMEMBER_MAX_CHUNKS/REMEMBER_CHUNK_CHARS), потом
+            # ОДНИМ финальным запросом собираем профиль + dere.
+            extracted = []
 
-Извлеки только информацию, которую человек
-явно сообщил о себе или своих интересах.
-
-Не угадывай:
-- возраст;
-- национальность;
-- религию;
-- здоровье;
-- сексуальную ориентацию;
-- политические взгляды;
-- другие чувствительные характеристики.
-
-Формат:
-- интересы;
-- хобби;
-- предпочтения;
-- языки, если человек сам их назвал;
-- явно упомянутые факты о себе;
-- важные темы переписки.
+            for index, chunk_text in enumerate(chunks, start=1):
+                prompt = f"""
+Извлеки из фрагмента личной переписки только то, что человек
+явно сообщил о себе или своих интересах (интересы, хобби,
+предпочтения, языки, факты о себе, важные темы). Не угадывай
+возраст, национальность, религию, здоровье, сексуальную
+ориентацию, политические взгляды и другие чувствительные
+характеристики.
 
 Фрагмент {index}:
 
 {chunk_text}
 """
 
-            try:
-                result = await ask_ai(prompt)
-                if result:
-                    extracted.append(result)
-            except Exception:
-                logger.exception(
-                    "Ошибка анализа remember chunk=%s",
-                    index,
+                try:
+                    result = await ask_ai(prompt)
+                    if result:
+                        extracted.append(result)
+                except Exception:
+                    logger.exception(
+                        "Ошибка анализа remember chunk=%s",
+                        index,
+                    )
+
+            if not extracted:
+                await event.edit(
+                    "Не удалось получить анализ истории."
                 )
+                return
 
-        if not extracted:
-            await event.edit(
-                "Не удалось получить анализ истории."
-            )
-            return
-
-        final = await ask_ai(
-            f"""
-Сделай краткий профиль собеседника на основе
-извлечённых фактов.
-
-Не добавляй ничего от себя.
-Не делай выводов о чувствительных характеристиках.
-Если факт неизвестен — не придумывай.
-
-Формат:
-
-Из переписки понятно, что человек:
-— ...
-— ...
-— ...
-
-Общий стиль общения: ...
-
-Факты:
-{chr(10).join(extracted)}
-"""
-        )
-
-        report = (
-            f"🧠 Память ({target_label}):\n\n" + final
-            if target_label
-            else "🧠 Память:\n\n" + final
-        )
-
-        # Шуточная dere-классификация — по манере переписки,
-        # не влияет на основной профиль и не должна ломать
-        # .remember целиком, если вдруг не получится.
-        try:
             dere_sample = "\n".join(messages)[:DERE_MAX_CHARS]
 
-            dere_result = await ask_ai(
-                DERE_CLASSIFICATION_PROMPT_TEMPLATE.format(
-                    combined_text=dere_sample
+            combined = await ask_ai(
+                REMEMBER_COMBINE_PROMPT_TEMPLATE.format(
+                    extracted_facts=chr(10).join(extracted),
+                    dere_sample=dere_sample,
                 )
             )
 
-            if dere_result:
-                report += (
-                    "\n\n🎭 Тип по манере общения (шуточно, "
-                    "не диагноз):\n" + dere_result
-                )
+        profile_text, dere_text = split_profile_and_dere(combined)
 
-        except Exception:
-            logger.exception(
-                "Ошибка dere-классификации | chat=%s",
-                chat_id,
+        report = (
+            f"🧠 Память ({target_label}):\n\n" + profile_text
+            if target_label
+            else "🧠 Память:\n\n" + profile_text
+        )
+
+        if dere_text:
+            report += (
+                "\n\n🎭 Тип по манере общения (шуточно, "
+                "не диагноз):\n" + dere_text
             )
 
         parts = split_for_telegram(report)
@@ -1914,10 +2647,12 @@ async def remember_command(event):
             await event.reply(part)
 
         logger.info(
-            "Remember completed | chat=%s | target=%s | messages=%s",
+            "Remember completed | chat=%s | target=%s | messages=%s "
+            "| chunks=%s",
             chat_id,
             target_label,
             len(messages),
+            len(chunks),
         )
 
     except Exception:
@@ -1959,6 +2694,18 @@ async def help_command(event):
         ".stats — статистика переписки (только в личке)",
         ".auto — автоответчик на слово «фен» (тумблер — "
         "только в Избранном; в др. чатах — только выключает)",
+        ".save — вкл/выкл сохранение удалённых сообщений "
+        "именно в этом чате",
+        ".f текст — анимированный текст (появляется по словам)",
+        ".geo место — отправить точку на карте "
+        "(© OpenStreetMap contributors)",
+        ".geolive место — трансляция геолокации 15 минут",
+        ".ocr — ответом на фото: достать текст и QR-код 🧪",
+        ".vm — ответом на голосовое/кружок: расшифровать речь",
+        ".paid <звёзды> — ответом на фото: отправить платно ⭐",
+        ".saveonce — ответом на одноразовое фото: сохранить "
+        "в Избранное, если ещё доступно",
+        ".info — информация о собеседнике (ID, @username и т.д.)",
         ".remember — профиль + шуточный dere-тип "
         "(в личке — собеседник, в группах — ответом на сообщение)",
         ".help — это сообщение",
@@ -1972,7 +2719,6 @@ async def help_command(event):
     ]
 
     await event.edit("\n".join(lines))
-
 
 
 # ============================================================
@@ -1993,6 +2739,9 @@ async def cache_message_for_delete_tracking(event):
     chat_id = event.chat_id
 
     if chat_id is None:
+        return
+
+    if chat_id in delete_tracker_excluded_chats:
         return
 
     text = event.raw_text or ""
@@ -2111,17 +2860,27 @@ async def report_deleted_message(
 ):
     try:
         if entry is None:
-            if chat_id_hint is not None:
-                chat_part = await get_chat_label(chat_id_hint)
-                text = (
-                    f"🗑 Удалено (не в кэше) — {chat_part}, "
-                    f"ID {msg_id}"
+            if chat_id_hint is None:
+                # Личка/обычная группа без записи в кэше — Telegram
+                # в принципе не сообщает chat_id для таких удалений,
+                # так что узнать, откуда сообщение, невозможно, а
+                # заодно нельзя и проверить, не выключен ли этот чат
+                # через .save. Раньше тут был плейсхолдер "неизвестно
+                # что удалено", но он мог всплыть и для чатов, которые
+                # специально отключили — поэтому просто молчим и
+                # оставляем след только в логе.
+                logger.info(
+                    "Удалено сообщение вне кэша (chat_id неизвестен "
+                    "Telegram'у) | msg_id=%s",
+                    msg_id,
                 )
-            else:
-                text = (
-                    f"🗑 Удалено (не в кэше, ID {msg_id}) — "
-                    "не успели закэшировать до удаления"
-                )
+                return
+
+            chat_part = await get_chat_label(chat_id_hint)
+            text = (
+                f"🗑 Удалено (не в кэше) — {chat_part}, "
+                f"ID {msg_id}"
+            )
 
             await notify_owner(text)
             return
@@ -2211,6 +2970,16 @@ async def deleted_message_handler(event):
 
     chat_id = event.chat_id
 
+    # Для супергрупп/каналов chat_id известен сразу — можно
+    # проверить исключение .save до похода в кэш. Для личек/
+    # обычных групп (chat_id is None) это невозможно в принципе,
+    # но раз мы туда и не кэшировали сообщения выключенных чатов
+    # (см. cache_message_for_delete_tracking), поиск в кэше и так
+    # ничего не найдёт — а на этот случай report_deleted_message
+    # больше не шлёт никакого плейсхолдера.
+    if chat_id is not None and chat_id in delete_tracker_excluded_chats:
+        return
+
     for msg_id in event.deleted_ids:
         if chat_id is not None:
             entry = channel_message_cache.pop(
@@ -2218,6 +2987,12 @@ async def deleted_message_handler(event):
             )
         else:
             entry = pm_message_cache.pop(msg_id, None)
+
+        if (
+            entry is not None
+            and entry.get("chat_id") in delete_tracker_excluded_chats
+        ):
+            continue
 
         await report_deleted_message(msg_id, chat_id, entry)
 
@@ -2469,7 +3244,17 @@ async def main():
     if ENABLE_HEALTH_SERVER:
         # Запускаем сразу, до client.start() — платформа должна
         # увидеть открытый порт как можно раньше при деплое.
-        await start_health_server()
+        # Ошибка здесь (например, порт уже занят) не должна ронять
+        # весь бот — это вспомогательная фича только для Render,
+        # без неё юзербот всё равно должен нормально работать.
+        try:
+            await start_health_server()
+        except Exception:
+            logger.exception(
+                "Не удалось запустить health-check сервер — "
+                "продолжаю без него (порт %s уже занят?)",
+                HEALTH_SERVER_PORT,
+            )
 
     await client.start()
 
@@ -2499,7 +3284,7 @@ async def main():
     print("Команды:")
     print(".catgirl")
     print(".tsundere")
-    print(".clone")
+    print(".clone (в группах — ответом на сообщение цели)")
     print(".reset")
     print(".mute 10m")
     print(".unmute")
@@ -2510,6 +3295,14 @@ async def main():
     print(".math 5 + 3")
     print(".stats")
     print(".auto (тумблер только из Избранного)")
+    print(".save (тумблер прямо в этом чате)")
+    print(".f текст")
+    print(".geo место / .geolive место")
+    print(".ocr (ответом на фото)")
+    print(".vm (ответом на голосовое/кружок)")
+    print(".paid <звёзды> (ответом на фото)")
+    print(".saveonce (ответом на одноразовое фото)")
+    print(".info")
     print(".help")
     print()
     print(

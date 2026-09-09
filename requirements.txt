@@ -2,3 +2,7 @@ telethon
 openai
 python-dotenv
 aiohttp
+opencv-python-headless
+pytesseract
+pydub
+SpeechRecognition

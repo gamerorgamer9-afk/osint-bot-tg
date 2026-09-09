@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: catgirl-userbot
+    env: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: TG_API_ID
+        sync: false
+      - key: TG_API_HASH
+        sync: false
+      - key: TG_SESSION
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: DEEPSEEK_MODEL
+        value: deepseek-v4-flash
+      - key: CATGIRL_MIN_DELAY
+        value: "1"
+      - key: CATGIRL_MAX_DELAY
+        value: "5"
+      - key: REMEMBER_MAX_MESSAGES
+        value: "10000"
+      - key: SPAM_MAX
+        value: "50"
+      - key: SPAM_DELAY
+        value: "0.8"
+      - key: SAVE_DELETED_MEDIA
+        value: "true"

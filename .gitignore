@@ -1,5 +1,7 @@
 .venv/
 logs/
 .env
+env
 __pycache__/
 *.pyc
+deleted_media_cache/

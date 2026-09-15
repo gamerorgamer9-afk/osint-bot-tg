@@ -282,19 +282,6 @@ processed_messages_order: deque[int] = deque(
     maxlen=PROCESSED_MESSAGES_MAX
 )
 
-# --- Автоответчик (.auto) ------------------------------------
-# Глобальный тумблер переключается ТОЛЬКО из Избранного
-# (Saved Messages). В любом другом чате .auto лишь добавляет
-# этот чат в исключения — включить обратно там же нельзя,
-# только заново через Избранное можно отключить/включить
-# автоответчик целиком (исключения при этом не сбрасываются).
-autoresponder_enabled: bool = False
-autoresponder_excluded_chats: set[int] = set()
-
-# ID владельца аккаунта — заполняется в main() после client.start(),
-# нужен, чтобы отличить Избранное от обычной личной переписки.
-OWNER_ID: int | None = None
-
 
 def mark_processed(message_id: int) -> bool:
     """Возвращает False, если сообщение уже было обработано."""
@@ -1739,24 +1726,65 @@ async def stats_command(event):
     try:
         await event.edit("📊 Считаю сообщения...")
 
-        # get_messages(limit=0, from_user=...) в Telethon иногда
-        # игнорирует фильтр по отправителю (известная особенность
-        # "быстрого" total-запроса) — поэтому считаем честно,
-        # перебирая историю и проверяя message.out на каждом
-        # сообщении, как это уже делает .remember.
-        mine_count = 0
-        his_count = 0
+        mine_count = None
+        his_count = None
+        total_count = None
+        used_fast_path = False
 
-        async for message in client.iter_messages(
-            chat_id,
-            limit=REMEMBER_MAX_MESSAGES,
-        ):
-            if message.out:
-                mine_count += 1
+        # Пробуем быстрый путь: просим у сервера только total
+        # (limit=1 — Telethon всё равно возвращает точный общий
+        # счётчик в .total, скачивать всю историю не нужно).
+        # ВАЖНО: в личных чатах Telethon иногда молча игнорирует
+        # фильтр from_user в этом режиме — тогда "моё" совпадёт
+        # с "общим", что физически невозможно (ты не мог написать
+        # 100% сообщений в диалоге с другим живым человеком).
+        # Ловим этот случай и откатываемся на честный перебор.
+        try:
+            total_result = await client.get_messages(chat_id, limit=1)
+            fast_total = total_result.total or 0
+
+            mine_result = await client.get_messages(
+                chat_id, limit=1, from_user="me"
+            )
+            fast_mine = mine_result.total or 0
+
+            if 0 < fast_mine < fast_total:
+                mine_count = fast_mine
+                his_count = fast_total - fast_mine
+                total_count = fast_total
+                used_fast_path = True
             else:
-                his_count += 1
+                logger.warning(
+                    ".stats: быстрый путь дал подозрительный "
+                    "результат (mine=%s, total=%s) — перехожу на "
+                    "точный перебор",
+                    fast_mine,
+                    fast_total,
+                )
 
-        total_count = mine_count + his_count
+        except Exception:
+            logger.exception(
+                ".stats: быстрый путь упал с ошибкой — перехожу "
+                "на точный перебор"
+            )
+
+        if not used_fast_path:
+            # Надёжный, но более медленный путь — перебираем
+            # историю сами и считаем message.out на каждом
+            # сообщении. Всегда даёт верный результат.
+            mine_count = 0
+            his_count = 0
+
+            async for message in client.iter_messages(
+                chat_id,
+                limit=REMEMBER_MAX_MESSAGES,
+            ):
+                if message.out:
+                    mine_count += 1
+                else:
+                    his_count += 1
+
+            total_count = mine_count + his_count
 
         chat_entity = await event.get_chat()
         peer_name = (
@@ -1773,19 +1801,22 @@ async def stats_command(event):
             f"Всего — {total_count}"
         )
 
-        if total_count >= REMEMBER_MAX_MESSAGES:
+        if not used_fast_path and total_count >= REMEMBER_MAX_MESSAGES:
             text += (
                 f"\n\n(учтены последние {REMEMBER_MAX_MESSAGES} "
-                "сообщений — история длиннее лимита REMEMBER_MAX_MESSAGES)"
+                "сообщений — история длиннее лимита "
+                "REMEMBER_MAX_MESSAGES)"
             )
 
         await event.edit(text)
 
         logger.info(
-            ".stats completed | chat=%s | mine=%s | his=%s",
+            ".stats completed | chat=%s | mine=%s | his=%s | "
+            "fast_path=%s",
             chat_id,
             mine_count,
             his_count,
+            used_fast_path,
         )
 
     except Exception:
@@ -1797,84 +1828,152 @@ async def stats_command(event):
 
 
 # ============================================================
-# .AUTO (автоответчик на слово "фен")
+# .AUTO (плановая отправка "фарма" / "/zalit" каждые N минут)
 # ============================================================
 
-AUTORESPONDER_TRIGGER_RE = re.compile(r"\bфен\b", re.IGNORECASE)
-AUTORESPONDER_REPLY_TEXT = "да?"
+# Сообщения отправляются ОТДЕЛЬНЫМИ сообщениями, в этом порядке.
+AUTO_FARM_MESSAGES = ["фарма", "/zalit"]
+
+AUTO_FARM_INTERVAL_MINUTES = int(
+    os.getenv("AUTO_FARM_INTERVAL_MINUTES", "40")
+)
+
+# Небольшая пауза между двумя сообщениями — чтобы они не улетали
+# одним и тем же миллисекундным залпом.
+AUTO_FARM_MESSAGE_DELAY = float(
+    os.getenv("AUTO_FARM_MESSAGE_DELAY", "1.5")
+)
+
+auto_farm_enabled: bool = False
+auto_farm_target_chat_id: int | None = None
+auto_farm_task: asyncio.Task | None = None
+
+
+async def auto_farm_loop():
+    try:
+        while True:
+            await asyncio.sleep(AUTO_FARM_INTERVAL_MINUTES * 60)
+
+            if not auto_farm_enabled or auto_farm_target_chat_id is None:
+                continue
+
+            try:
+                for index, text in enumerate(AUTO_FARM_MESSAGES):
+                    await client.send_message(
+                        auto_farm_target_chat_id, text
+                    )
+
+                    if index < len(AUTO_FARM_MESSAGES) - 1:
+                        await asyncio.sleep(AUTO_FARM_MESSAGE_DELAY)
+
+                logger.info(
+                    "Auto-farm: отправлено | chat=%s",
+                    auto_farm_target_chat_id,
+                )
+
+            except Exception:
+                logger.exception(
+                    "Auto-farm: ошибка отправки | chat=%s",
+                    auto_farm_target_chat_id,
+                )
+
+    except asyncio.CancelledError:
+        logger.info("Auto-farm: цикл остановлен")
+        raise
+
+
+def ensure_auto_farm_task():
+    global auto_farm_task
+
+    if auto_farm_task is None or auto_farm_task.done():
+        auto_farm_task = asyncio.create_task(auto_farm_loop())
+
+
+def cancel_auto_farm_task():
+    global auto_farm_task
+
+    if auto_farm_task is not None and not auto_farm_task.done():
+        auto_farm_task.cancel()
+
+    auto_farm_task = None
 
 
 @client.on(
     events.NewMessage(
         outgoing=True,
-        pattern=r"^\.auto$",
+        pattern=r"^\.auto(?:\s+(\S+))?$",
     )
 )
 async def auto_command(event):
-    global autoresponder_enabled
+    global auto_farm_enabled, auto_farm_target_chat_id
 
+    arg = event.pattern_match.group(1)
     chat_id = event.chat_id
 
-    if chat_id == OWNER_ID:
-        # Избранное — главный тумблер, переключает автоответчик
-        # целиком во всех чатах (кроме тех, что были исключены
-        # отдельно — исключения при переключении не сбрасываются).
-        autoresponder_enabled = not autoresponder_enabled
-
-        status = "включён" if autoresponder_enabled else "выключен"
-        await event.edit(f"🤖 Автоответчик глобально {status}.")
-
-        logger.info(
-            "Autoresponder global toggle | enabled=%s",
-            autoresponder_enabled,
-        )
+    if arg is None:
+        if auto_farm_enabled and auto_farm_target_chat_id is not None:
+            target_label = await get_chat_label(auto_farm_target_chat_id)
+            await event.edit(
+                f"🌾 Автопостинг включён — каждые "
+                f"{AUTO_FARM_INTERVAL_MINUTES} мин. в {target_label}."
+            )
+        else:
+            await event.edit("🌾 Автопостинг выключен.")
         return
 
-    # Любой другой чат — .auto здесь только ВЫКЛЮЧАЕТ
-    # автоответчик именно в этом чате. Включить обратно можно
-    # только глобальным тумблером из Избранного.
-    autoresponder_excluded_chats.add(chat_id)
+    arg_lower = arg.lower()
+
+    if arg_lower == "here":
+        auto_farm_target_chat_id = chat_id
+        auto_farm_enabled = True
+        ensure_auto_farm_task()
+
+        messages_preview = "» и «".join(AUTO_FARM_MESSAGES)
+        await event.edit(
+            f"🌾 Автопостинг включён здесь — раз в "
+            f"{AUTO_FARM_INTERVAL_MINUTES} мин. буду слать «"
+            f"{messages_preview}»."
+        )
+
+        logger.info("Auto-farm enabled | target=%s", chat_id)
+        return
+
+    if arg_lower == "off":
+        auto_farm_enabled = False
+        cancel_auto_farm_task()
+
+        await event.edit("🌾 Автопостинг выключен.")
+
+        logger.info("Auto-farm disabled")
+        return
+
+    if arg_lower == "on":
+        if auto_farm_target_chat_id is None:
+            await event.edit(
+                "❌ Сначала укажи чат: напиши .auto here прямо "
+                "в нужной группе/чате."
+            )
+            return
+
+        auto_farm_enabled = True
+        ensure_auto_farm_task()
+
+        target_label = await get_chat_label(auto_farm_target_chat_id)
+        await event.edit(f"🌾 Автопостинг включён — {target_label}.")
+
+        logger.info(
+            "Auto-farm re-enabled | target=%s",
+            auto_farm_target_chat_id,
+        )
+        return
 
     await event.edit(
-        "🤖 Автоответчик отключён в этом чате "
-        "(включить обратно можно только из Избранного)."
+        "Использование:\n"
+        ".auto — статус\n"
+        ".auto here — включить рассылку в этом чате\n"
+        ".auto on — включить на ранее заданный чат\n"
+        ".auto off — выключить"
     )
-
-    logger.info(
-        "Autoresponder excluded chat | chat=%s",
-        chat_id,
-    )
-
-
-@client.on(events.NewMessage(incoming=True))
-async def autoresponder_handler(event):
-    if not autoresponder_enabled:
-        return
-
-    chat_id = event.chat_id
-
-    if chat_id is None or chat_id in autoresponder_excluded_chats:
-        return
-
-    text = event.raw_text or ""
-
-    if not AUTORESPONDER_TRIGGER_RE.search(text):
-        return
-
-    try:
-        await event.reply(AUTORESPONDER_REPLY_TEXT)
-
-        logger.info(
-            "Autoresponder triggered | chat=%s | message=%s",
-            chat_id,
-            event.id,
-        )
-
-    except Exception:
-        logger.exception(
-            "Autoresponder: не удалось ответить | chat=%s",
-            chat_id,
-        )
 
 
 # ============================================================
@@ -2692,8 +2791,8 @@ async def help_command(event):
         ".decide A или B — выбор с обоснованием",
         ".math 5 + 3 — калькулятор (+ - * / % : x, скобки)",
         ".stats — статистика переписки (только в личке)",
-        ".auto — автоответчик на слово «фен» (тумблер — "
-        "только в Избранном; в др. чатах — только выключает)",
+        ".auto here / .auto on / .auto off — плановая отправка "
+        "«фарма»+«/zalit» каждые 40 мин в выбранный чат",
         ".save — вкл/выкл сохранение удалённых сообщений "
         "именно в этом чате",
         ".f текст — анимированный текст (появляется по словам)",
@@ -3260,9 +3359,6 @@ async def main():
 
     me = await client.get_me()
 
-    global OWNER_ID
-    OWNER_ID = me.id
-
     logger.info(
         "Авторизован: id=%s username=%s",
         me.id,
@@ -3294,7 +3390,7 @@ async def main():
     print(".decide A или B")
     print(".math 5 + 3")
     print(".stats")
-    print(".auto (тумблер только из Избранного)")
+    print(".auto here / .auto on / .auto off")
     print(".save (тумблер прямо в этом чате)")
     print(".f текст")
     print(".geo место / .geolive место")
